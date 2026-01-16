@@ -8,10 +8,15 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langchain_community.utilities import SQLDatabase 
 import plotly.express as px  # Import Plotly Express for interactive charts
-from dotenv import load_dotenv
+import os
 # ---------- CONFIGURATION ----------
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")      #os.getenv("OPENAI_API_KEY")  # Set this environment variable to your new key
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
+
+
+
+
+     #os.getenv("OPENAI_API_KEY")  # Set this environment variable to your new key
 
 # --- 1. CONFIGURATION ---
 
