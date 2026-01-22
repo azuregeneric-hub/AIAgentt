@@ -1,3 +1,4 @@
+
 import os
 import pandas as pd
 import sqlite3
@@ -11,8 +12,8 @@ import plotly.express as px  # Import Plotly Express for interactive charts
 import re  # Added for extracting potential filter values
  
 # ---------- CONFIGURATION ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
  
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
 # --- 1. CONFIGURATION ---
  
 db_path = "my_data.db"
@@ -132,19 +133,49 @@ class AgentState(TypedDict):
 # --- 4. AGENT NODES ---
 def architect_agent(state: AgentState):
     """
-    Role: The Brain. Handles greetings and recursive KPI formula lookups.
+    Role: The Brain. Handles greetings, chit-chat, and recursive KPI formula lookups.
     """
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
    
-    # Check for Greetings
-    greetings = ["hi", "hello", "hey", "hii", "thanks", "thank you"]
-    if state['question'].lower().strip() in greetings:
+    # Use LLM to classify intent
+    intent_prompt = f"""
+    Classify the user question: "{state['question']}"
+    
+    Possible intents:
+    - GREETING_CHITCHAT: Greetings (hi, hello, hey, variations/misspellings), casual questions (how are you, what do you do, what's your work, who are you), off-topic (weather today, unrelated to finance).
+    - KPI_QUERY: Questions about financial metrics, KPIs, data analysis from the database.
+    
+    If GREETING_CHITCHAT, output only "GREETING_CHITCHAT".
+    If KPI_QUERY, output only "KPI_QUERY".
+    If unsure, default to KPI_QUERY.
+    """
+    intent_response = llm.invoke(intent_prompt)
+    intent = intent_response.content.strip()
+    
+    if intent == "GREETING_CHITCHAT":
+        # Generate engaging response
+        today = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        greeting_prompt = f"""
+        User query: "{state['question']}"
+        Current time - {today}
+        
+        Generate an engaging, active response as a Financial AI Intelligence partner.
+        Personalize with  time-based greeting, and make it fun/professional.
+        For off-topic like weather, politely redirect: "I'm focused on financial analysis, but if you meant something else, let me know!"
+        For "what do you do": Explain role briefly.
+        Keep concise, end with a question like "What financial metrics can I help with today?"
+        Examples:
+        - "how is the weather today": "Hey ! I'm not a weather bot, but here in Dehrdaun it's probably sunny. 😊 As your Financial AI, how can I assist with metrics?"
+        - "what do u do": "Hi ! I analyze financial KPIs like CM%, Utilization, and more from your data. What's a metric you'd like insights on?"
+        """
+        response = llm.invoke(greeting_prompt)
         return {
             "is_greeting": True,
             "architect_plan": "GREETING",
-            "insight": "Hello! I am your Financial AI Intelligence partner. How can I help you analyze your metrics today?"
+            "insight": response.content
         }
  
+    # If KPI_QUERY, proceed as before
     today = datetime.now().strftime('%Y-%m-%d')
  
     # Recursive KPI Lookup: Architect looks at CM%, then looks for Revenue/Cost definitions
@@ -168,13 +199,14 @@ def architect_agent(state: AgentState):
     7.If in a KPI calculation, there is a division, so plz mutilpy that with 100 in order to get percentage value.
     8. For KPI calculations that come from the utt table, use the 'Date_a' field (normalized to YYYY-MM-DD) for time dimensions and to apply time filters.
     9. If the query references specific values (e.g., 'A1'), note them for potential column disambiguation in filters.
-    10.DU also means 'Exec DU' column from p_and_l .So if in a query someone asks to calculate/display by DU,that means groupby by 'Exec DU' column from p_and_l.
-    11.BU also means 'Exec DG' column from p_and_l .So if in a query someone asks to calculate/display by BU,that means groupby by 'Exec DG' column from p_and_l
+    10.DU also means 'Exec DU' column from p_and_l or  'Delivery_Unit' column from utt table .So if in a query someone asks to calculate/display by DU,that means groupby by 'Exec DU' column from p_and_lor by 'Delivery_Unit' from utt depending on the query
+    11.BU also means 'Exec DG' column from p_and_l or 'DeliveryGroup' column from utt table .So if in a query someone asks to calculate/display by BU,that means groupby by 'Exec DG' column from p_and_l or by 'DeliveryGroup' from utt depending on the query
     12. If the user question contains relative time references like "this quarter", "last quarter", "YTD", etc., resolve them to specific date ranges based on the current date.
     - Quarters are defined as: Q1: Jan 1 - Mar 31, Q2: Apr 1 - Jun 30, Q3: Jul 1 - Sep 30, Q4: Oct 1 - Dec 31.
     - "This quarter" is the quarter containing the current date.
     - "Last quarter" is the previous quarter; if current is Q1, last is Q4 of previous year.
     - Specify the exact BETWEEN 'start_date' AND 'end_date' for each in the plan (e.g., this quarter: '2026-01-01' AND '2026-03-31').
+    13. If the query mentions multiple grouping fields like 'DU/BU/account', interpret it as requiring grouping by each field separately.  For trends, include a time dimension like quarter or month in the grouping as meantioned in the user query.Dont show the time dimension in user table.
     """
     response = llm.invoke(prompt)
     return {"architect_plan": response.content, "is_greeting": False}
@@ -248,7 +280,7 @@ def sql_analyst_agent(state: AgentState):
    
     CRITICAL RULES:
     - Use EXACT 'Group1' strings for filters.
- 
+    - Use Exact column names for joining the two tables.Do not add any join conditions beyond the exact JOIN RULES provided.
     - Handle division by zero with NULLIF(denominator, 0).
     - Default grouping: FinalCustomerName.
     - Use ONLY column names from the === AUTHORIZED COLUMN NAMES === section, exactly as listed in "Safe SQL Name".
@@ -260,7 +292,10 @@ def sql_analyst_agent(state: AgentState):
     - For time filters on utt, use only the join on p.Month = u.Date_a and the filter on p.Month. Do NOT add redundant BETWEEN clauses on u.Date_a, as Date_a represents the 1st of the month and the join handles the matching.
     - Always GROUP BY p.FinalCustomerName (not u.FinalCustomerName) for consistency, as p_and_l is the primary revenue source.
     - If the plan specifies relative time references, use the current date to confirm date ranges, but prefer the resolved ranges from the plan.
- 
+    - If the plan requires grouping by multiple fields separately (e.g., for trends by DU, BU, account), create a query that computes the KPI for each grouping separately, perhaps using UNION ALL with an additional column indicating the grouping type (e.g., 'Group Type' as 'DU', 'BU', or 'Account'), and include the time dimension (e.g., quarter) in the GROUP BY.
+    - For Margin drop calculation, For column "Segment" equals to 'Transportation', Group the column "Group Description" by sum of values in column "Amount in USD" where Column "Type" is 'Cost'
+      Check the difference of these grouped costs between last month and its previous month.List Costs which have increased in last month as compared to its previous month.Do not apply  filters on Month in/Month between , "Group1" , "Exec DU". Also 'transportation' from "Segment" column is in lower case.Dont apply any  additional filter on Month. Apply "or" condition between Type and Segment filter.
+    -If the user asks for rate drops, increases, or comparisons (e.g., “realized rate dropped more than $3”), generate a CTE that computes the KPI for both the current and previous period (typically month or quarter), and then compare them in the final SELECT. Always compute both values explicitly — do not reference non-existent columns like PreviousRealizedRate.
     🚨 SQLITE AGGREGATE RULE (MANDATORY):
     - WHERE = row-level filters (Month, WBSID, FinalCustomerName)
     - HAVING = aggregate filters (SUM, COUNT, CM% < 30, avg > 80%)
@@ -452,3 +487,4 @@ if prompt := st.chat_input("Ask a question..."):
  
                 with st.expander("Technical Log"):
                     st.code(output["query"], language="sql")
+ 
