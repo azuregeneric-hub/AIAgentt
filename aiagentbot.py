@@ -21,8 +21,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
  
 # --- 2. DATABASE & KPI INITIALIZATION ---
 def initialize_database():
-    pl_csv = os.path.join(current_dir, "P&LL.csv")
-    utt_csv = os.path.join(current_dir, "UTT.csv")
+    pl_csv = os.path.join(current_dir, "P&Lold.csv")
+    utt_csv = os.path.join(current_dir, "UTold.csv")
     kpi_excel = os.path.join(current_dir, "KPI_Definitions.xlsx")
    
     if os.path.exists(pl_csv) and os.path.exists(utt_csv):
@@ -90,6 +90,7 @@ candidate_columns = {
  
 value_to_cols = defaultdict(list)  # {val: [(table, col, count), ...]}
  
+# In build_reverse_lookup function (change the length filter)
 def build_reverse_lookup():
     global value_to_cols
     conn = sqlite3.connect(db_path)
@@ -102,7 +103,7 @@ def build_reverse_lookup():
                 df = pd.read_sql_query(query, conn)
                 for _, row in df.iterrows():
                     val = str(row[col]).strip().upper()  # Normalize: upper, no spaces/punct
-                    if len(val) > 2:  # Filter noise
+                    if len(val) >= 2:  # Changed to >=2 to include short IDs like 'A1'
                         value_to_cols[val].append((table, col, int(row['cnt'])))
             except Exception as e:
                 print(f"Skip {table}.{col}: {e}")
@@ -140,27 +141,27 @@ def architect_agent(state: AgentState):
     # Use LLM to classify intent
     intent_prompt = f"""
     Classify the user question: "{state['question']}"
-    
+   
     Possible intents:
     - GREETING_CHITCHAT: Greetings (hi, hello, hey, variations/misspellings), casual questions (how are you, what do you do, what's your work, who are you), off-topic (weather today, unrelated to finance).
     - KPI_QUERY: Questions about financial metrics, KPIs, data analysis from the database.
-    
+   
     If GREETING_CHITCHAT, output only "GREETING_CHITCHAT".
     If KPI_QUERY, output only "KPI_QUERY".
     If unsure, default to KPI_QUERY.
     """
     intent_response = llm.invoke(intent_prompt)
     intent = intent_response.content.strip()
-    
+   
     if intent == "GREETING_CHITCHAT":
         # Generate engaging response
         today = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         greeting_prompt = f"""
         User query: "{state['question']}"
         Current time - {today}
-        
+       
         Generate an engaging, active response as a Financial AI Intelligence partner.
-        Personalize with  time-based greeting, and make it fun/professional.
+        Personalize with  time-based greeting as per IST, and make it fun/professional.
         For off-topic like weather, politely redirect: "I'm focused on financial analysis, but if you meant something else, let me know!"
         For "what do you do": Explain role briefly.
         Keep concise, end with a question like "What financial metrics can I help with today?"
@@ -198,7 +199,7 @@ def architect_agent(state: AgentState):
     6. FinalCustomerName also means account/accounts.So if in a query someone asks to calculate by account,that means groupby by FinalCustomerName
     7.If in a KPI calculation, there is a division, so plz mutilpy that with 100 in order to get percentage value.
     8. For KPI calculations that come from the utt table, use the 'Date_a' field (normalized to YYYY-MM-DD) for time dimensions and to apply time filters.
-    9. If the query references specific values (e.g., 'A1'), note them for potential column disambiguation in filters.
+    9. If the query references specific values (e.g., 'A1') without specifying the column, note them for potential column disambiguation in filters. Suggest likely columns based on context (e.g., if 'for account A1', note 'likely FinalCustomerName'). Do NOT add the filter in the plan—let disambiguator resolve. If value is a number like '30', treat as threshold, not filter value.
     10.DU also means 'Exec DU' column from p_and_l or  'Delivery_Unit' column from utt table .So if in a query someone asks to calculate/display by DU,that means groupby by 'Exec DU' column from p_and_lor by 'Delivery_Unit' from utt depending on the query
     11.BU also means 'Exec DG' column from p_and_l or 'DeliveryGroup' column from utt table .So if in a query someone asks to calculate/display by BU,that means groupby by 'Exec DG' column from p_and_l or by 'DeliveryGroup' from utt depending on the query
     12. If the user question contains relative time references like "this quarter", "last quarter", "YTD", etc., resolve them to specific date ranges based on the current date.
@@ -207,39 +208,50 @@ def architect_agent(state: AgentState):
     - "Last quarter" is the previous quarter; if current is Q1, last is Q4 of previous year.
     - Specify the exact BETWEEN 'start_date' AND 'end_date' for each in the plan (e.g., this quarter: '2026-01-01' AND '2026-03-31').
     13. If the query mentions multiple grouping fields like 'DU/BU/account', interpret it as requiring grouping by each field separately.  For trends, include a time dimension like quarter or month in the grouping as meantioned in the user query.Dont show the time dimension in user table.
+    14. If the query mentions by specific month, please use the correct date format of '%Y-%m-%d' , as also defined earlier.
+    15. Do not add filters for specific values in the plan unless the query explicitly specifies the column (e.g., "for account A1"). For ambiguous "for A1", let the disambiguator resolve and add the filter.
+    16.Since the Month column from p_and_l and Date_a column from utt contains only the starting date of each month, so when asked for  a specific month filter, dont apply the last date of the month in between filter.Also applu 2025 year only if the query does not mention any year
     """
     response = llm.invoke(prompt)
     return {"architect_plan": response.content, "is_greeting": False}
  
+# In disambiguator_agent function (change the regex)
+# In disambiguator_agent function (refine regex to require starting with a letter)
+# In disambiguator_agent (disable fuzzy for short IDs if no exact match, to avoid wrong columns)
 def disambiguator_agent(state: AgentState):
     if state.get("is_greeting"):
         return {"disambiguated_plan": state["architect_plan"]}
- 
-    potential_values = re.findall(r'\b[A-Z][-\w]{5,}\b', state['question'])  # ID-like
+
+    potential_values = re.findall(r'\b[A-Z][A-Z0-9-]{1,}\b', state['question'])
    
     if not potential_values:
         return {"disambiguated_plan": state["architect_plan"]}
    
     filters = []
+    is_account_query = any(word in state['question'].lower() for word in ['account', 'customer', 'finalcustomername'])  # Enhanced context check
     for val in set(pv.upper() for pv in potential_values):
         if val in value_to_cols and value_to_cols[val]:
             candidates = value_to_cols[val]
-            # Rule 1: Exact highest count
-            best = candidates[0]
+            # Prefer 'FinalCustomerName' if in candidates and query suggests account
+            preferred_candidates = [c for c in candidates if c[1] == 'FinalCustomerName'] if is_account_query else candidates
+            best = preferred_candidates[0] if preferred_candidates else candidates[0]
             table_alias = 'u' if 'utt' in best[0] else 'p'
             filter_sql = f'{table_alias}.\"{best[1]}\" = \'{val}\''
             filters.append(filter_sql)
-            print(f"Matched '{val}' → {best[0]}.\"{best[1]}\" ({best[2]} rows)")  # Log
+            print(f"Matched '{val}' → {best[0]}.\"{best[1]}\" ({best[2]} rows)")
         else:
-            # Fuzzy fallback (top 1 match >80% similarity)
-            fuzzy = []
-            for v in value_to_cols:
-                if len(get_close_matches(val, [v], n=1, cutoff=0.8)):
-                    fuzzy.append(value_to_cols[v][0])
-            if fuzzy:
-                best = max(fuzzy, key=lambda x: x[2])
-                filters.append(f'u.\"{best[1]}\" LIKE \'%{val}%\'')
- 
+            # Skip fuzzy for short values (<5 chars) to avoid mismatches; only use if exact not found but longer
+            if len(val) >= 5:
+                fuzzy = []
+                for v in value_to_cols:
+                    if len(get_close_matches(val, [v], n=1, cutoff=0.8)):
+                        fuzzy.append(value_to_cols[v][0])
+                if fuzzy:
+                    best = max(fuzzy, key=lambda x: x[2])
+                    filters.append(f'{ "u" if "utt" in best[0] else "p" }.\"{best[1]}\" LIKE \'%{val}%\'')
+            else:
+                print(f"No exact match for short value '{val}'; skipping fuzzy to avoid errors.")
+
     if filters:
         filter_str = " AND " + " AND ".join(filters)
         updated_plan = state["architect_plan"] + f"\n\nADD FILTERS: {filter_str}"
@@ -247,7 +259,6 @@ def disambiguator_agent(state: AgentState):
         updated_plan = state["architect_plan"] + "\n\nNo matching columns for filters."
    
     return {"disambiguated_plan": updated_plan}
- 
  
  
 def sql_analyst_agent(state: AgentState):
@@ -296,6 +307,8 @@ def sql_analyst_agent(state: AgentState):
     - For Margin drop calculation, For column "Segment" equals to 'Transportation', Group the column "Group Description" by sum of values in column "Amount in USD" where Column "Type" is 'Cost'
       Check the difference of these grouped costs between last month and its previous month.List Costs which have increased in last month as compared to its previous month.Do not apply  filters on Month in/Month between , "Group1" , "Exec DU". Also 'transportation' from "Segment" column is in lower case.Dont apply any  additional filter on Month. Apply "or" condition between Type and Segment filter.
     -If the user asks for rate drops, increases, or comparisons (e.g., “realized rate dropped more than $3”), generate a CTE that computes the KPI for both the current and previous period (typically month or quarter), and then compare them in the final SELECT. Always compute both values explicitly — do not reference non-existent columns like PreviousRealizedRate.
+    -Apply ONLY the exact ADD FILTERS from the disambiguated plan for specific values. If no ADD FILTERS, do NOT add any for mentioned values. For thresholds like '< 30', use in HAVING, not as string filters (e.g., no LIKE '%30%').
+    - For aliases in SQL, replace special characters like '&' with '_and_' (e.g., 'C&B' becomes 'C_and_B') to avoid syntax errors. Do not use unquoted aliases with special characters.
     🚨 SQLITE AGGREGATE RULE (MANDATORY):
     - WHERE = row-level filters (Month, WBSID, FinalCustomerName)
     - HAVING = aggregate filters (SUM, COUNT, CM% < 30, avg > 80%)
@@ -487,4 +500,3 @@ if prompt := st.chat_input("Ask a question..."):
  
                 with st.expander("Technical Log"):
                     st.code(output["query"], language="sql")
- 
