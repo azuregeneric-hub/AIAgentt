@@ -15,10 +15,10 @@ import re  # Added for extracting potential filter values
  
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
 # --- 1. CONFIGURATION ---
- 
+
 db_path = "my_data.db"
 current_dir = os.path.dirname(os.path.abspath(__file__))
- 
+
 # --- 2. DATABASE & KPI INITIALIZATION ---
 def initialize_database():
     pl_csv = os.path.join(current_dir, "P&Lold.csv")
@@ -130,6 +130,7 @@ class AgentState(TypedDict):
     error: Optional[str]
     schema: str
     is_greeting: bool
+    is_explanation: bool  # Added explicitly
  
 # --- 4. AGENT NODES ---
 def architect_agent(state: AgentState):
@@ -144,11 +145,18 @@ def architect_agent(state: AgentState):
    
     Possible intents:
     - GREETING_CHITCHAT: Greetings (hi, hello, hey, variations/misspellings), casual questions (how are you, what do you do, what's your work, who are you), off-topic (weather today, unrelated to finance).
-    - KPI_QUERY: Questions about financial metrics, KPIs, data analysis from the database.
+    - KPI_EXPLANATION: Questions asking for definitions, formulas, components (e.g., numerator, denominator), how a KPI is calculated, or breakdowns of metrics (e.g., "what is CM%?", "numerator for Revenue?", "explain the formula for Cost"). If the question uses words like 'give the formula', 'what is the formula', 'explain the formula', or similar, classify as KPI_EXPLANATION.
+    - KPI_QUERY: Questions about computing or analyzing financial metrics, KPIs, data from the database (e.g., "calculate CM% for last quarter", "show Utilization by account").
    
-    If GREETING_CHITCHAT, output only "GREETING_CHITCHAT".
-    If KPI_QUERY, output only "KPI_QUERY".
-    If unsure, default to KPI_QUERY.
+    Examples:
+    - "hi there": GREETING_CHITCHAT
+    - "what is the formula for CM%?": KPI_EXPLANATION
+    - "give the formula for cm%": KPI_EXPLANATION
+    - "give the numerator and denominator for utilization": KPI_EXPLANATION
+    - "calculate cm% for transportation": KPI_QUERY
+    - "show formula and calculate cm%": KPI_QUERY  # Mixed, but involves computation, so QUERY
+   
+    Output ONLY the intent name (e.g., "KPI_EXPLANATION"). If unsure, default to KPI_QUERY.
     """
     intent_response = llm.invoke(intent_prompt)
     intent = intent_response.content.strip()
@@ -172,52 +180,150 @@ def architect_agent(state: AgentState):
         response = llm.invoke(greeting_prompt)
         return {
             "is_greeting": True,
+            "is_explanation": False,
             "architect_plan": "GREETING",
             "insight": response.content
         }
+    
+    elif intent == "KPI_EXPLANATION":
+       today = datetime.now().strftime('%Y-%m-%d')
+       explanation_prompt = f"""
+       You are a helpful Financial AI. Provide a clear, natural language explanation of the KPI based on this context.
+
+       KPI CONTEXT FROM EXCEL:
+       {kpi_context}
+
+       USER QUESTION: {state['question']}
+       Current date: {today}
+
+       DIRECTIONS:
+       1. Identify the KPI (e.g., CM%, Revenue, Cost).
+       2. Extract and explain the formula in simple terms.
+       3. For questions about numerator/denominator: Break it down explicitly (e.g., "Numerator: Revenue - Cost; Denominator: Revenue").
+       4. Use bullet points for clarity (e.g., - Numerator: ..., - Denominator: ...).
+       5. Make it conversational: Start with "Sure, let me explain..." and end with "Does that help, or do you want an example calculation?"
+       6. If the formula references other KPIs, recursively explain them briefly (e.g., "CM% is (Revenue - Cost) / Revenue * 100. Revenue is the sum of...").
+       7. Reference exact 'Group1' categories from the context.
+       8. No SQL or data queries—just explanation.
+
+       Keep response concise and natural.
+       """
+       response = llm.invoke(explanation_prompt)
+       return {
+        "is_greeting": False,
+        "is_explanation": True,
+        "architect_plan": "EXPLANATION",
+        "insight": response.content
+       }
+
+    else:  # KPI_QUERY (explicit else for clarity)
+        today = datetime.now().strftime('%Y-%m-%d')
  
-    # If KPI_QUERY, proceed as before
+        # Recursive KPI Lookup: Architect looks at CM%, then looks for Revenue/Cost definitions
+        prompt = f"""
+        You are the Architect Agent. Your job is to analyze the user question using the KPI context.
+       
+        Current date: {today}
+       
+        KPI CONTEXT FROM EXCEL:
+        {kpi_context}
+     
+        USER QUESTION: {state['question']}
+     
+        DIRECTIONS:
+        1. Identify the primary KPI (e.g., CM%, Utilization,UT).
+        2. Scrutinize the formula. If it refers to other metrics (e.g., Revenue, Cost,NetAvailableHours,TotalBillableHours etc), find those definitions too.
+        3. List the EXACT 'Group1' categories needed for every part of the calculation.
+        4. Specify if a JOIN between 'p_and_l' and 'utt' is necessary.
+        5. Use ONLY column names from the === AUTHORIZED COLUMN NAMES === section, exactly as listed in "Safe SQL Name".
+        6. FinalCustomerName also means account/accounts.So if in a query someone asks to calculate by account,that means groupby by FinalCustomerName
+        7.If in a KPI calculation, there is a division, so plz mutilpy that with 100 in order to get percentage value.
+        8. For KPI calculations that come from the utt table, use the 'Date_a' field (normalized to YYYY-MM-DD) for time dimensions and to apply time filters.
+        9. If the query references specific values (e.g., 'A1') without specifying the column, note them for potential column disambiguation in filters. Suggest likely columns based on context (e.g., if 'for account A1', note 'likely FinalCustomerName'). Do NOT add the filter in the plan—let disambiguator resolve. If value is a number like '30', treat as threshold, not filter value.
+        10.DU also means 'Exec DU' column from p_and_l or  'Delivery_Unit' column from utt table .So if in a query someone asks to calculate/display by DU,that means groupby by 'Exec DU' column from p_and_lor by 'Delivery_Unit' from utt depending on the query
+        11.BU also means 'Exec DG' column from p_and_l or 'DeliveryGroup' column from utt table .So if in a query someone asks to calculate/display by BU,that means groupby by 'Exec DG' column from p_and_l or by 'DeliveryGroup' from utt depending on the query
+        12. If the user question contains relative time references like "this quarter", "last quarter", "YTD", etc., resolve them to specific date ranges based on the current date.
+        - Quarters are defined as: Q1: Jan 1 - Mar 31, Q2: Apr 1 - Jun 30, Q3: Jul 1 - Sep 30, Q4: Oct 1 - Dec 31.
+        - "This quarter" is the quarter containing the current date.
+        - "Last quarter" is the previous quarter; if current is Q1, last is Q4 of previous year.
+        - Specify the exact BETWEEN 'start_date' AND 'end_date' for each in the plan (e.g., this quarter: '2026-01-01' AND '2026-03-31').
+        13. If the query mentions multiple grouping fields like 'DU/BU/account', interpret it as requiring grouping by each field separately.  For trends, include a time dimension like quarter or month in the grouping as meantioned in the user query.Dont show the time dimension in user table.
+        14. If the query mentions by specific month, please use the correct date format of '%Y-%m-%d' , as also defined earlier.
+        15. Do not add filters for specific values in the plan unless the query explicitly specifies the column (e.g., "for account A1"). For ambiguous "for A1", let the disambiguator resolve and add the filter.
+        16.Since the Month column from p_and_l and Date_a column from utt contains only the starting date of each month, so when asked for  a specific month filter, dont apply the last date of the month in between filter.Also applu 2025 year only if the query does not mention any year.
+        17.CM also means CM%.
+        """
+        response = llm.invoke(prompt)
+        return {"architect_plan": response.content, "is_greeting": False, "is_explanation": False}
+
+# ... (disambiguator_agent remains unchanged)
+
+def sql_analyst_agent(state: AgentState):
+    """
+    Role: The Coder. Translates the Architect's plan into raw SQLite.
+    """
+    if state.get("is_greeting") or state.get("is_explanation"):
+        return {"query": "SKIP"}
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
     today = datetime.now().strftime('%Y-%m-%d')
- 
-    # Recursive KPI Lookup: Architect looks at CM%, then looks for Revenue/Cost definitions
-    prompt = f"""
-    You are the Architect Agent. Your job is to analyze the user question using the KPI context.
    
+    prompt = f"""
+    You are the Data Analyst Agent. Write a SQLite query based on this Disambiguated Plan:
+    {state['disambiguated_plan']}
+ 
     Current date: {today}
    
-    KPI CONTEXT FROM EXCEL:
-    {kpi_context}
+    SCHEMA: {state['schema']}
+    JOIN RULES:
+    - p_and_l.Segment = utt.Segment
+    - p_and_l.FinalCustomerName = utt.FinalCustomerName
+    - p_and_l.Contract ID = utt.sales document
+    - p_and_l.wbs id = utt.WBSID
+    - p_and_l.Month = utt.Date_a
+    - p_and_l.PVDG = utt.ParticipatingVDG
+    - p_and_l.PVDU = utt.ParticipatingVDU
+    - p_and_l.Exec DG = utt.DeliveryGroup
+    - p_and_l.Exec DU = utt.Delivery_Unit
+   
+    CRITICAL RULES:
+    - If the plan is purely explanatory (e.g., describes a formula without requesting computation, grouping, or filters), output 'SKIP' — do not generate SQL.
+    - Use EXACT 'Group1' strings for filters.
+    - Use Exact column names for joining the two tables.Do not add any join conditions beyond the exact JOIN RULES provided.
+    - Handle division by zero with NULLIF(denominator, 0).
+    - Default grouping: FinalCustomerName.
+    - Use ONLY column names from the === AUTHORIZED COLUMN NAMES === section, exactly as listed in "Safe SQL Name".
+    - For percentage KPIs like CM%,UT,Billed rate,Realized Rate,Revenue Per Person,Onsite Utilization,Offshore Utilization always multiply the calculation by 100 to get values between 0 and 100 (not 0 to 1).
+    - For filters on percentages (e.g., "less than 80"), treat as percentage (HAVING "CM%" < 80, not < 0.80).
+    - FinalCustomerName also means account/accounts.So if in a query someone asks to calculate by account,that means groupby by FinalCustomerName.
+    - For time-based filters or grouping (e.g., monthly), use p.Month or u.Date_a, as they are both normalized to 'YYYY-MM-DD' format (e.g., '2025-12-01').
+    - When joining p_and_l and utt, ALWAYS include ALL the listed JOIN RULES exactly as specified in the ON clause, regardless of whether the calculation is aggregate/overall or grouped (e.g., per FinalCustomerName). This ensures accurate matching of records before any summation or grouping to avoid data inflation or mismatches.
+    - For time filters on utt, use only the join on p.Month = u.Date_a and the filter on p.Month. Do NOT add redundant BETWEEN clauses on u.Date_a, as Date_a represents the 1st of the month and the join handles the matching.
+    - Always GROUP BY p.FinalCustomerName (not u.FinalCustomerName) for consistency, as p_and_l is the primary revenue source.
+    - If the plan specifies relative time references, use the current date to confirm date ranges, but prefer the resolved ranges from the plan.
+    - If the plan requires grouping by multiple fields separately (e.g., for trends by DU, BU, account), create a query that computes the KPI for each grouping separately, perhaps using UNION ALL with an additional column indicating the grouping type (e.g., 'Group Type' as 'DU', 'BU', or 'Account'), and include the time dimension (e.g., quarter) in the GROUP BY.
+    - For Margin drop calculation, For column "Segment" equals to 'Transportation', Group the column "Group Description" by sum of values in column "Amount in USD" where Column "Type" is 'Cost'
+      Check the difference of these grouped costs between last month and its previous month.List Costs which have increased in last month as compared to its previous month.Do not apply  filters on Month in/Month between , "Group1" , "Exec DU". Also 'transportation' from "Segment" column is in lower case.Dont apply any  additional filter on Month. Apply "or" condition between Type and Segment filter.
+    - If the user asks for rate drops, increases, or comparisons (e.g., “realized rate dropped more than $3”), generate a CTE that computes the KPI for both the current and previous period (typically month or quarter), and then compare them in the final SELECT. Always compute both values explicitly — do not reference non-existent columns like PreviousRealizedRate.
+    - Apply ONLY the exact ADD FILTERS from the disambiguated plan for specific values. If no ADD FILTERS, do NOT add any for mentioned values. For thresholds like '< 30', use in HAVING, not as string filters (e.g., no LIKE '%30%').
+    - For aliases in SQL, replace special characters like '&' with '_and_' (e.g., 'C&B' becomes 'C_and_B') to avoid syntax errors. Do not use unquoted aliases with special characters.
+    🚨 SQLITE AGGREGATE RULE (MANDATORY):
+    - WHERE = row-level filters (Month, WBSID, FinalCustomerName)
+    - HAVING = aggregate filters (SUM, COUNT, CM% < 30, avg > 80%)
+    - ORDER: WHERE → GROUP BY → HAVING → ORDER BY
+    Examples:
+    ❌ WRONG: WHERE SUM(revenue) > 1000
+    ✅ RIGHT: GROUP BY customer HAVING SUM(revenue) > 1000
+    ❌ WRONG: WHERE CM% < 30
+    ✅ RIGHT: GROUP BY FinalCustomerName HAVING CM% < 30
  
-    USER QUESTION: {state['question']}
- 
-    DIRECTIONS:
-    1. Identify the primary KPI (e.g., CM%, Utilization,UT).
-    2. Scrutinize the formula. If it refers to other metrics (e.g., Revenue, Cost,NetAvailableHours,TotalBillableHours etc), find those definitions too.
-    3. List the EXACT 'Group1' categories needed for every part of the calculation.
-    4. Specify if a JOIN between 'p_and_l' and 'utt' is necessary.
-    5. Use ONLY column names from the === AUTHORIZED COLUMN NAMES === section, exactly as listed in "Safe SQL Name".
-    6. FinalCustomerName also means account/accounts.So if in a query someone asks to calculate by account,that means groupby by FinalCustomerName
-    7.If in a KPI calculation, there is a division, so plz mutilpy that with 100 in order to get percentage value.
-    8. For KPI calculations that come from the utt table, use the 'Date_a' field (normalized to YYYY-MM-DD) for time dimensions and to apply time filters.
-    9. If the query references specific values (e.g., 'A1') without specifying the column, note them for potential column disambiguation in filters. Suggest likely columns based on context (e.g., if 'for account A1', note 'likely FinalCustomerName'). Do NOT add the filter in the plan—let disambiguator resolve. If value is a number like '30', treat as threshold, not filter value.
-    10.DU also means 'Exec DU' column from p_and_l or  'Delivery_Unit' column from utt table .So if in a query someone asks to calculate/display by DU,that means groupby by 'Exec DU' column from p_and_lor by 'Delivery_Unit' from utt depending on the query
-    11.BU also means 'Exec DG' column from p_and_l or 'DeliveryGroup' column from utt table .So if in a query someone asks to calculate/display by BU,that means groupby by 'Exec DG' column from p_and_l or by 'DeliveryGroup' from utt depending on the query
-    12. If the user question contains relative time references like "this quarter", "last quarter", "YTD", etc., resolve them to specific date ranges based on the current date.
-    - Quarters are defined as: Q1: Jan 1 - Mar 31, Q2: Apr 1 - Jun 30, Q3: Jul 1 - Sep 30, Q4: Oct 1 - Dec 31.
-    - "This quarter" is the quarter containing the current date.
-    - "Last quarter" is the previous quarter; if current is Q1, last is Q4 of previous year.
-    - Specify the exact BETWEEN 'start_date' AND 'end_date' for each in the plan (e.g., this quarter: '2026-01-01' AND '2026-03-31').
-    13. If the query mentions multiple grouping fields like 'DU/BU/account', interpret it as requiring grouping by each field separately.  For trends, include a time dimension like quarter or month in the grouping as meantioned in the user query.Dont show the time dimension in user table.
-    14. If the query mentions by specific month, please use the correct date format of '%Y-%m-%d' , as also defined earlier.
-    15. Do not add filters for specific values in the plan unless the query explicitly specifies the column (e.g., "for account A1"). For ambiguous "for A1", let the disambiguator resolve and add the filter.
-    16.Since the Month column from p_and_l and Date_a column from utt contains only the starting date of each month, so when asked for  a specific month filter, dont apply the last date of the month in between filter.Also applu 2025 year only if the query does not mention any year
+    - RETURN RAW SQL ONLY. No markdown blocks, no ```sql.
     """
     response = llm.invoke(prompt)
-    return {"architect_plan": response.content, "is_greeting": False}
- 
-# In disambiguator_agent function (change the regex)
-# In disambiguator_agent function (refine regex to require starting with a letter)
-# In disambiguator_agent (disable fuzzy for short IDs if no exact match, to avoid wrong columns)
+    # Cleaning Layer to prevent the "near ```sql" error
+    clean_sql = response.content.replace("```sql", "").replace("```", "").strip()
+    return {"query": clean_sql}
+
 def disambiguator_agent(state: AgentState):
     if state.get("is_greeting"):
         return {"disambiguated_plan": state["architect_plan"]}
@@ -260,74 +366,9 @@ def disambiguator_agent(state: AgentState):
    
     return {"disambiguated_plan": updated_plan}
  
- 
-def sql_analyst_agent(state: AgentState):
-    """
-    Role: The Coder. Translates the Architect's plan into raw SQLite.
-    """
-    if state.get("is_greeting"):
-        return {"query": "SKIP"}
- 
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    today = datetime.now().strftime('%Y-%m-%d')
-   
-    prompt = f"""
-    You are the Data Analyst Agent. Write a SQLite query based on this Disambiguated Plan:
-    {state['disambiguated_plan']}
- 
-    Current date: {today}
-   
-    SCHEMA: {state['schema']}
-    JOIN RULES:
-    - p_and_l.Segment = utt.Segment
-    - p_and_l.FinalCustomerName = utt.FinalCustomerName
-    - p_and_l.Contract ID = utt.sales document
-    - p_and_l.wbs id = utt.WBSID
-    - p_and_l.Month = utt.Date_a
-    - p_and_l.PVDG = utt.ParticipatingVDG
-    - p_and_l.PVDU = utt.ParticipatingVDU
-    - p_and_l.Exec DG = utt.DeliveryGroup
-    - p_and_l.Exec DU = utt.Delivery_Unit
-   
-    CRITICAL RULES:
-    - Use EXACT 'Group1' strings for filters.
-    - Use Exact column names for joining the two tables.Do not add any join conditions beyond the exact JOIN RULES provided.
-    - Handle division by zero with NULLIF(denominator, 0).
-    - Default grouping: FinalCustomerName.
-    - Use ONLY column names from the === AUTHORIZED COLUMN NAMES === section, exactly as listed in "Safe SQL Name".
-    - For percentage KPIs like CM%,UT,Billed rate,Realized Rate,Revenue Per Person,Onsite Utilization,Offshore Utilization always multiply the calculation by 100 to get values between 0 and 100 (not 0 to 1).
-    - For filters on percentages (e.g., "less than 80"), treat as percentage (HAVING "CM%" < 80, not < 0.80).
-    - FinalCustomerName also means account/accounts.So if ina query someone asks to calculate by account,that means groupby by FinalCustomerName.
-    - For time-based filters or grouping (e.g., monthly), use p.Month or u.Date_a, as they are both normalized to 'YYYY-MM-DD' format (e.g., '2025-12-01').
-    - When joining p_and_l and utt, ALWAYS include ALL the listed JOIN RULES exactly as specified in the ON clause, regardless of whether the calculation is aggregate/overall or grouped (e.g., per FinalCustomerName). This ensures accurate matching of records before any summation or grouping to avoid data inflation or mismatches.
-    - For time filters on utt, use only the join on p.Month = u.Date_a and the filter on p.Month. Do NOT add redundant BETWEEN clauses on u.Date_a, as Date_a represents the 1st of the month and the join handles the matching.
-    - Always GROUP BY p.FinalCustomerName (not u.FinalCustomerName) for consistency, as p_and_l is the primary revenue source.
-    - If the plan specifies relative time references, use the current date to confirm date ranges, but prefer the resolved ranges from the plan.
-    - If the plan requires grouping by multiple fields separately (e.g., for trends by DU, BU, account), create a query that computes the KPI for each grouping separately, perhaps using UNION ALL with an additional column indicating the grouping type (e.g., 'Group Type' as 'DU', 'BU', or 'Account'), and include the time dimension (e.g., quarter) in the GROUP BY.
-    - For Margin drop calculation, For column "Segment" equals to 'Transportation', Group the column "Group Description" by sum of values in column "Amount in USD" where Column "Type" is 'Cost'
-      Check the difference of these grouped costs between last month and its previous month.List Costs which have increased in last month as compared to its previous month.Do not apply  filters on Month in/Month between , "Group1" , "Exec DU". Also 'transportation' from "Segment" column is in lower case.Dont apply any  additional filter on Month. Apply "or" condition between Type and Segment filter.
-    -If the user asks for rate drops, increases, or comparisons (e.g., “realized rate dropped more than $3”), generate a CTE that computes the KPI for both the current and previous period (typically month or quarter), and then compare them in the final SELECT. Always compute both values explicitly — do not reference non-existent columns like PreviousRealizedRate.
-    -Apply ONLY the exact ADD FILTERS from the disambiguated plan for specific values. If no ADD FILTERS, do NOT add any for mentioned values. For thresholds like '< 30', use in HAVING, not as string filters (e.g., no LIKE '%30%').
-    - For aliases in SQL, replace special characters like '&' with '_and_' (e.g., 'C&B' becomes 'C_and_B') to avoid syntax errors. Do not use unquoted aliases with special characters.
-    🚨 SQLITE AGGREGATE RULE (MANDATORY):
-    - WHERE = row-level filters (Month, WBSID, FinalCustomerName)
-    - HAVING = aggregate filters (SUM, COUNT, CM% < 30, avg > 80%)
-    - ORDER: WHERE → GROUP BY → HAVING → ORDER BY
-    Examples:
-    ❌ WRONG: WHERE SUM(revenue) > 1000
-    ✅ RIGHT: GROUP BY customer HAVING SUM(revenue) > 1000
-    ❌ WRONG: WHERE CM% < 30
-    ✅ RIGHT: GROUP BY FinalCustomerName HAVING CM% < 30
- 
-    - RETURN RAW SQL ONLY. No markdown blocks, no ```sql.
-    """
-    response = llm.invoke(prompt)
-    # Cleaning Layer to prevent the "near ```sql" error
-    clean_sql = response.content.replace("```sql", "").replace("```", "").strip()
-    return {"query": clean_sql}
- 
+
 def execute_query_node(state: AgentState):
-    if state.get("is_greeting") or state.get("query") == "SKIP": return {"result": pd.DataFrame()}
+    if state.get("is_greeting") or state.get("is_explanation") or state.get("query") == "SKIP": return {"result": pd.DataFrame()}
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query(state["query"], conn)
@@ -335,9 +376,11 @@ def execute_query_node(state: AgentState):
         return {"result": df, "error": None}
     except Exception as e:
         return {"error": str(e), "result": pd.DataFrame()}
+
+# ... (visualizer_agent, insights_agent, graph, UI remain unchanged)
  
 def visualizer_agent(state: AgentState):
-    if state.get("is_greeting") or state.get("error") or state["result"].empty: return {"chart_code": ""}
+    if state.get("is_greeting") or state.get("is_explanation") or state.get("error") or state["result"].empty: return {"chart_code": ""}
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
    
     cols = list(state['result'].columns)
@@ -375,8 +418,8 @@ RAW CODE ONLY. No explanations or markdown.
     response = llm.invoke(prompt)
     return {"chart_code": response.content.strip().replace("```python", "").replace("```", "")}
  
-def insights_agent(state: AgentState):
-    if state.get("is_greeting"): return {"insight": state.get("insight")}
+def insights_agent(state: AgentState) :
+    if state.get("is_greeting") or state.get("is_explanation"): return {"insight": state.get("insight")}
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5)
     prompt = f"Provide 2-sentence business insight for: {state['result'].head().to_string()}"
     response = llm.invoke(prompt)
