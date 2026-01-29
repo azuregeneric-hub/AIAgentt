@@ -252,6 +252,21 @@ def architect_agent(state: AgentState):
         15. Do not add filters for specific values in the plan unless the query explicitly specifies the column (e.g., "for account A1"). For ambiguous "for A1", let the disambiguator resolve and add the filter.
         16.Since the Month column from p_and_l and Date_a column from utt contains only the starting date of each month, so when asked for  a specific month filter, dont apply the last date of the month in between filter.Also applu 2025 year only if the query does not mention any year.
         17.CM also means CM%.
+        18. **Root Cause / Factor Analysis**: If the user asks for "factors," "why," or "reasons" for a value (e.g., "Why is cost high for A24?"):
+        - Do NOT generate a plan for a single total.
+        - Instead, create a plan to BREAK DOWN the metric by "Group Description" and "Group1".
+        - If a specific customer is mentioned (e.g., 'A24'), the plan must specify: "Filter by FinalCustomerName = 'A24' and GROUP BY 'Group Description'".
+        - This allows the user to see which specific expenses (like Fuel, Maintenance, etc.) contributed most to the total.
+        STRICT HIERARCHY RULES:
+        1. **Formula Lookup**: If a user asks for "Cost", look at the 'Formula' column in the KPI context. 
+        For Cost, you MUST use: "Group1" IN ('Direct Expense', 'OWN OVERHEADS', 'Indirect Expense', 'Project Level Depreciation', 'Direct Expense - DU Block Seats Allocation','Direct Expense - DU Pool Allocation','Establishment Expenses')
+        2. **Segment Filtering**: If the question mentions "Transportation", "Logistics", etc., these are values in the "Segment" column. 
+        3. **Combined Logic**: For "Transportation Cost", the plan must include:
+        - Filter by "Segment" = 'Transportation'
+        - Filter by the list of "Group1" categories found in the Cost formula.
+   
+        4. **Join Logic**: If the calculation requires both P&L and UTT, specify the join. Otherwise, use 'p_and_l' as the primary table for financial costs.
+        5. **Avoid Hallucination**: Do NOT use "Type" = 'Cost' unless specifically asked. Use the 'Group1' categories for all KPI math.
         """
         response = llm.invoke(prompt)
         return {"architect_plan": response.content, "is_greeting": False, "is_explanation": False}
@@ -307,6 +322,18 @@ def sql_analyst_agent(state: AgentState):
     - If the user asks for rate drops, increases, or comparisons (e.g., “realized rate dropped more than $3”), generate a CTE that computes the KPI for both the current and previous period (typically month or quarter), and then compare them in the final SELECT. Always compute both values explicitly — do not reference non-existent columns like PreviousRealizedRate.
     - Apply ONLY the exact ADD FILTERS from the disambiguated plan for specific values. If no ADD FILTERS, do NOT add any for mentioned values. For thresholds like '< 30', use in HAVING, not as string filters (e.g., no LIKE '%30%').
     - For aliases in SQL, replace special characters like '&' with '_and_' (e.g., 'C&B' becomes 'C_and_B') to avoid syntax errors. Do not use unquoted aliases with special characters.
+    MANDATORY RULES:
+    1. **No Hallucinated Filters**: Do not add `OR "Type" = 'Cost'` or any filter not explicitly mentioned in the architect's plan.
+    2. **KPI Formulas**: When the plan mentions 'Cost', use the SUM of "Amount in USD" where "Group1" matches the specific categories (Direct Expense, etc.).
+    3. **Case Sensitivity**: Segment values like 'Transportation' should match the database. Use: WHERE "Segment" = 'Transportation' (ensure correct casing).
+    4. **Filtering**: Always use AND to combine Segment filters and Group1 filters. 
+       Example: WHERE "Segment" = 'Transportation' AND "Group1" IN ('Direct Expense', 'Indirect Expense')
+    5. **Aggregation**: Use SUM("Amount in USD").
+    6. **Factor/Breakdown Logic**: 
+    - When the plan asks for "factors" or "breakdown":
+    - SELECT "Group Description" (or the relevant descriptive column) and the SUM("Amount in USD").
+    - ALWAYS add `ORDER BY SUM("Amount in USD") DESC` so the biggest factors appear first.
+    - This provides the necessary data for the Insight Agent to explain the 'Why'.
     🚨 SQLITE AGGREGATE RULE (MANDATORY):
     - WHERE = row-level filters (Month, WBSID, FinalCustomerName)
     - HAVING = aggregate filters (SUM, COUNT, CM% < 30, avg > 80%)
@@ -328,7 +355,7 @@ def disambiguator_agent(state: AgentState):
     if state.get("is_greeting"):
         return {"disambiguated_plan": state["architect_plan"]}
 
-    potential_values = re.findall(r'\b[A-Z][A-Z0-9-]{1,}\b', state['question'])
+    potential_values = re.findall(r'\b[a-zA-Z0-9-]{2,}\b', state['question'])
    
     if not potential_values:
         return {"disambiguated_plan": state["architect_plan"]}
@@ -418,13 +445,27 @@ RAW CODE ONLY. No explanations or markdown.
     response = llm.invoke(prompt)
     return {"chart_code": response.content.strip().replace("```python", "").replace("```", "")}
  
-def insights_agent(state: AgentState) :
-    if state.get("is_greeting") or state.get("is_explanation"): return {"insight": state.get("insight")}
+def insights_agent(state: AgentState):
+    if state.get("is_greeting") or state.get("is_explanation"): 
+        return {"insight": state.get("insight")}
+    
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5)
-    prompt = f"Provide 2-sentence business insight for: {state['result'].head().to_string()}"
+    
+    # Improved prompt for factor analysis
+    prompt = f"""
+    Analyze the following data result for the user's question: "{state['question']}"
+    
+    DATA:
+    {state['result'].to_string()}
+    
+    INSTRUCTIONS:
+    - If the data is a breakdown (multiple rows), identify the top 2-3 highest factors and explain their impact.
+    - If the values are negative, mention if they represent credits or potential data anomalies.
+    - Keep it professional and focused on business impact.
+    - Limit to 3 concise sentences.
+    """
     response = llm.invoke(prompt)
     return {"insight": response.content}
- 
 # --- 5. GRAPH ---
 builder = StateGraph(AgentState)
 builder.add_node("architect", architect_agent)
