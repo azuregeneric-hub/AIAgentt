@@ -604,152 +604,111 @@ graph = builder.compile(checkpointer=memory)
 
 # --- 1. GLOBAL CONFIG & PERSISTENCE ---
 # --- 1. GLOBAL CONFIG & PERSISTENCE ---
+
+
 st.set_page_config(page_title="Financial AI Agent", layout="wide", page_icon="🏛️")
 
-# Initialize storage from File (Ensuring helper functions exist in your script)
+# Ensure these functions (load_history, save_history, delete_chat_session, clear_all_history_file) 
+# are imported from your backend script or defined above this line.
+
 if "all_chats" not in st.session_state:
     st.session_state.all_chats = load_history()
 
-# Initialize the current session
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.messages = []
 
-# --- 2. PROFESSIONAL UI STYLING (The "Gemini/Grok" Look) ---
+# --- 2. PROFESSIONAL UI STYLING ---
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
 
-    /* Main background and font */
-    .stApp {
-        background-color: #ffffff;
-        font-family: 'Roboto', sans-serif;
-    }
+    .stApp { background-color: #ffffff; font-family: 'Roboto', sans-serif; }
 
-    /* Sidebar - Clean Light Gray Theme (Inspired by Gemini/Grok) */
     [data-testid="stSidebar"] {
-        background-color: #f8f9fc !important; /* Subtle light gray for professionalism */
-        border-right: 1px solid #dcdcdc;
-        width: 300px !important; /* Wider sidebar for better usability */
-        padding-top: 1rem;
+        background-color: #f0f4f9 !important;
+        border-right: 1px solid #e3e3e3;
+        width: 300px !important;
     }
 
-    /* FIX: Show the hamburger menu clearly */
-    [data-testid="stHeader"] {
-        background-color: rgba(255, 255, 255, 0);
-        color: #202124;
-    }
-
-    /* Sidebar Title / Branding */
-    .sidebar-brand {
-        font-size: 1.4rem;
-        font-weight: 500;
-        color: #1a73e8; /* Google/Gemini blue */
-        padding: 1rem 1.5rem 1.5rem 1.5rem;
-        border-bottom: 1px solid #e0e0e0;
-    }
-
-    /* Professional Sidebar Section Headers */
     .sidebar-header {
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #5f6368;
-        text-transform: uppercase;
-        letter-spacing: 0.05rem;
-        margin: 1.5rem 0 0.75rem 1.5rem;
+        font-size: 0.75rem; 
+        font-weight: 600; 
+        color: #1a73e8;
+        text-transform: uppercase; 
+        letter-spacing: 0.08rem;
+        margin-top: 2.5rem !important;
+        margin-bottom: 0.8rem !important;
+        padding-left: 0.5rem;
     }
 
-    /* Sidebar Buttons - Rounded, Clean, and Subtle */
+    .first-header { margin-top: 1rem !important; }
+
     .stButton > button {
-        border: none;
-        background-color: transparent;
-        color: #202124;
-        transition: all 0.2s ease;
-        border-radius: 8px !important; /* Soft rounded corners like Grok/Gemini */
+        border: none !important; 
+        background-color: transparent !important; 
+        color: #444746 !important;
+        transition: all 0.2s ease-in-out;
+        border-radius: 8px !important; 
         text-align: left !important;
-        font-size: 0.95rem;
-        padding: 0.75rem 1.5rem;
-        width: 100%;
+        font-size: 0.9rem; 
+        padding: 0.6rem 1rem !important;
+        width: 100%; 
+        display: flex; 
+        justify-content: flex-start;
     }
 
-    /* Active Chat Highlight (Subtle Blue Tint) */
     .stButton > button[kind="primary"] {
-        background-color: #e8f0fe !important; /* Light blue for active state */
-        color: #1967d2 !important;
-        font-weight: 500;
+        background-color: #d3e3fd !important; 
+        color: #041e49 !important;
     }
 
-    /* Hover effect */
     .stButton > button:hover {
-        background-color: #f1f3f4;
-        border: none;
+        background-color: #e8f0fe !important; 
+        color: #1a73e8 !important;
+        transform: translateX(2px);
     }
 
-    /* Delete Button Styling */
-    .delete-button > button {
-        background-color: transparent;
-        color: #5f6368;
-        font-size: 0.85rem;
-        padding: 0.5rem;
-        min-width: auto;
-        border-radius: 50%;
+    div[data-testid="stPopover"] {
+        background-color: transparent !important;
     }
 
-    .delete-button > button:hover {
-        background-color: #e8eaed;
-    }
-
-    /* Chat Input Styling */
-    [data-testid="stChatInput"] {
-        border-radius: 28px;
-        border: 1px solid #dadce0;
-        padding: 8px 16px;
-        background-color: #f8f9fa;
-    }
-
-    /* Assistant Message Styling */
-    [data-testid="stChatMessageAssistant"] {
-        background-color: #ffffff !important;
-        border-radius: 12px;
-        padding: 1rem;
+    div[data-testid="stPopover"] button {
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #5f6368 !important;
+        padding: 0 !important;
+        width: 24px !important;
+        height: 24px !important;
     }
     
-    /* User Message Styling */
-    [data-testid="stChatMessageUser"] {
-        background-color: #e8f0fe !important;
-        border-radius: 12px;
-        padding: 1rem;
+    .stExpander details summary svg {
+        display: none !important;
     }
+    
+    .stExpander {
+        border: none !important;
+        background-color: transparent !important;
+    }
+
+    [data-testid="stVerticalBlock"] { gap: 0.1rem !important; }
 
     .main-title {
-        font-family: 'Roboto', sans-serif;
-        font-weight: 500;
-        font-size: 1.8rem;
-        color: #202124;
-        text-align: left;
-        margin: 1rem 0 2rem 0;
-        padding-left: 1rem;
-    }
-
-    /* Expander Styling */
-    .stExpander {
-        border: none;
-        background-color: transparent;
-    }
-
-    .stExpander > div > button {
-        color: #5f6368;
-        font-weight: 500;
+        font-weight: 500; font-size: 1.6rem; color: #1f1f1f;
+        margin: 1rem 0 2rem 1rem;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 3. SIDEBAR: CHAT HISTORY ---
+# --- 3. SIDEBAR: NAVIGATION ---
 with st.sidebar:
-    st.markdown("<div class='sidebar-brand'>🏛️ Financial IQ</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size: 1.3rem; font-weight: 500; color: #1a73e8; padding: 1.5rem 0.5rem;'>🏛️ Financial IQ</div>", unsafe_allow_html=True)
     
-    # "New Chat" Action
-    if st.button("➕ New Analysis", use_container_width=True, type="primary"):
+    # --- ACTIONS ---
+    st.markdown("<p class='sidebar-header first-header'>Actions</p>", unsafe_allow_html=True)
+    if st.button("➕ New Chat" \
+    "", use_container_width=True, type="primary"):
         if st.session_state.messages:
             st.session_state.all_chats[st.session_state.thread_id] = {
                 "messages": st.session_state.messages,
@@ -760,50 +719,60 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.markdown("<p class='sidebar-header'>Recent Analyses</p>", unsafe_allow_html=True)
-    
-    # Scrollable History Container
-    with st.container():
-        sorted_chats = sorted(st.session_state.all_chats.items(), key=lambda x: x[1].get("updated_at", datetime.now()), reverse=True)
-        
-        for tid, data in sorted_chats:
-            msgs = data["messages"]
-            first_q = next((m["content"] for m in msgs if m["role"] == "user"), "New Analysis")
-            title = str(first_q)[:25] + "..." if len(str(first_q)) > 25 else str(first_q)
+    # --- HISTORY ---
+    st.markdown("<p class='sidebar-header'>History</p>", unsafe_allow_html=True)
+    with st.expander("📂 Recent Chats", expanded=False):
+        if not st.session_state.all_chats:
+            st.info("No history yet.")
+        else:
+            sorted_chats = sorted(
+                st.session_state.all_chats.items(), 
+                key=lambda x: x[1].get("updated_at", datetime.now()), 
+                reverse=True
+            )
             
-            updated_at = data.get("updated_at", datetime.now())
-            delta = datetime.now() - updated_at
-            if delta.days >= 1:
-                time_str = f"{delta.days}d ago"
-            elif delta.seconds // 3600 >= 1:
-                time_str = f"{delta.seconds // 3600}h ago"
-            else:
-                time_str = f"{delta.seconds // 60}m ago"
-            
-            button_label = f"{title} • {time_str}"
-            
-            c1, c2 = st.columns([0.85, 0.15])
-            with c1:
-                is_active = tid == st.session_state.thread_id
-                if st.button(button_label, key=f"btn_{tid}", use_container_width=True, type="primary" if is_active else "secondary"):
-                    st.session_state.thread_id = tid
-                    st.session_state.messages = msgs
-                    st.rerun()
-            with c2:
-                st.markdown("<div class='delete-button'>", unsafe_allow_html=True)
-                if st.button("🗑️", key=f"del_{tid}", help="Delete chat"):
-                    delete_chat_session(tid)
-                    st.rerun()
-                st.markdown("</div>", unsafe_allow_html=True)
+            for tid, data in sorted_chats:
+                msgs = data["messages"]
+                first_q = next((m["content"] for m in msgs if m["role"] == "user"), "New Analysis")
+                title = str(first_q)[:18] + "..." if len(str(first_q)) > 18 else str(first_q)
+                
+                # Logic for "Time Ago" label
+                updated_at = data.get("updated_at", datetime.now())
+                delta = datetime.now() - updated_at
+                if delta.days >= 1:
+                    time_str = f"{delta.days}d"
+                elif delta.seconds // 3600 >= 1:
+                    time_str = f"{delta.seconds // 3600}h"
+                else:
+                    time_str = f"{delta.seconds // 60}m"
 
-    # Fixed Bottom Controls
-    st.markdown("<div style='margin-top: auto; padding-bottom: 1rem;'></div>", unsafe_allow_html=True)
-    with st.expander("⚙️ Settings"):
+                c1, c2 = st.columns([0.85, 0.15])
+                with c1:
+                    is_active = tid == st.session_state.thread_id
+                    if st.button(f" {title} • {time_str}", key=f"btn_{tid}", use_container_width=True, type="primary" if is_active else "secondary"):
+                        st.session_state.thread_id = tid
+                        st.session_state.messages = msgs
+                        st.rerun()
+                with c2:
+                    with st.popover("⋮"):
+                        # USE YOUR ORIGINAL BACKEND FUNCTION HERE
+                        if st.button("🗑️ Delete", key=f"del_{tid}"):
+                            delete_chat_session(tid) # This calls your actual file deletion logic
+                            if tid == st.session_state.thread_id:
+                                st.session_state.thread_id = str(uuid.uuid4())
+                                st.session_state.messages = []
+                            st.rerun()
+
+    # --- SYSTEM ---
+    st.markdown("<p class='sidebar-header'>System</p>", unsafe_allow_html=True)
+    with st.expander("⚙️ Settings", expanded=False):
         if st.button("🗑️ Clear All History", use_container_width=True):
-            clear_all_history_file()
+            clear_all_history_file() # This calls your actual file clearing logic
+            st.session_state.all_chats = {}
+            st.session_state.thread_id = str(uuid.uuid4())
+            st.session_state.messages = []
             st.rerun()
-
-# --- 4. MAIN CHAT INTERFACE ---
+# --- 4. MAIN CONTENT ---
 st.markdown("<h1 class='main-title'>Financial Intelligence Engine</h1>", unsafe_allow_html=True)
 
 schema_info = db.get_table_info()
