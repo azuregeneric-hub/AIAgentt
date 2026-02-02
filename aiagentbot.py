@@ -11,10 +11,38 @@ from langchain_community.utilities import SQLDatabase
 import plotly.express as px  # Import Plotly Express for interactive charts
 import re  # Added for extracting potential filter values
 from langgraph.checkpoint.memory import MemorySaver
+import uuid
+import pickle
+
+
+DB_FILE = "financial_agent_history.pkl"
+
+def save_history():
+    with open(DB_FILE, "wb") as f:
+        pickle.dump(st.session_state.all_chats, f)
+
+def load_history():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "rb") as f:
+                return pickle.load(f)
+        except:
+            return {}
+    return {}
+
+# --- INITIALIZE STATE ---
+if "all_chats" not in st.session_state:
+    st.session_state.all_chats = load_history()
+
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.messages = []
  
 # ---------- CONFIGURATION ----------
  
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
+# --- 1. CONFIGURATION ---
+
 # --- 1. CONFIGURATION ---
 
 db_path = "my_data.db"
@@ -556,14 +584,72 @@ memory = MemorySaver()
 graph = builder.compile(checkpointer=memory)
 
 
-# --- 6. UI ---
+# --- 1. GLOBAL CONFIG & PERSISTENCE ---
 st.set_page_config(page_title="Financial AI Agent", layout="wide")
 
-# Initialize Thread ID for Memory (Persistent across reruns)
-if "thread_id" not in st.session_state:
-    import uuid
-    st.session_state.thread_id = str(uuid.uuid4())
+# Initialize storage from File
+if "all_chats" not in st.session_state:
+    st.session_state.all_chats = load_history()
 
+# Initialize the current session
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.messages = []
+
+# --- 3. SIDEBAR: CHAT HISTORY (ChatGPT Style) ---
+with st.sidebar:
+    st.title("🕒 Chat History")
+    
+    # "New Chat" Button
+    if st.button("➕ New Chat", use_container_width=True, type="primary"):
+        # Save the current chat before wiping it
+        if st.session_state.messages:
+            st.session_state.all_chats[st.session_state.thread_id] = {
+                "messages": st.session_state.messages,
+                "updated_at": datetime.now()
+            }
+            save_history()
+        
+        # Create a brand new session
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Sort past chats by timestamp
+    sorted_chats = sorted(
+        st.session_state.all_chats.items(), 
+        key=lambda x: x[1].get("updated_at", datetime.now()), 
+        reverse=True
+    )
+
+    if not sorted_chats and not st.session_state.messages:
+        st.write("No conversations yet.")
+    
+    for tid, data in sorted_chats:
+        msgs = data["messages"]
+        # Use first user question as title
+        first_q = next((m["content"] for m in msgs if m["role"] == "user"), "New Conversation")
+        title = str(first_q)[:30] + "..." if len(str(first_q)) > 30 else str(first_q)
+        
+        # Highlight active chat
+        is_active = tid == st.session_state.thread_id
+        if st.button(f"💬 {title}", key=tid, use_container_width=True, type="primary" if is_active else "secondary"):
+            # Save current chat state before switching
+            if st.session_state.messages:
+                st.session_state.all_chats[st.session_state.thread_id] = {
+                    "messages": st.session_state.messages,
+                    "updated_at": datetime.now()
+                }
+            
+            # Switch to selected chat
+            st.session_state.thread_id = tid
+            st.session_state.messages = msgs
+            save_history()
+            st.rerun()
+
+# --- 4. UI STYLING ---
 st.markdown("""
     <style>
     [data-testid="stDataFrame"] td, [data-testid="stDataFrame"] th { text-align: center !important; }
@@ -576,19 +662,23 @@ st.title("🏛️ Financial Multi-Agent Intelligence")
 
 schema_info = db.get_table_info()
 
-# Initialize message history
-if "messages" not in st.session_state: 
-    st.session_state.messages = []
-
-# Display chat history
+# --- 5. DISPLAY CURRENT CHAT (With Re-rendering Logic) ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if isinstance(msg["content"], pd.DataFrame): 
             st.dataframe(msg["content"], use_container_width=True, hide_index=True)
+        elif isinstance(msg["content"], dict) and msg["content"].get("is_chart"):
+            # Re-render persistent charts from saved code
+            try:
+                chart_df = msg["content"]["df"]
+                chart_code = msg["content"]["code"]
+                exec(chart_code, globals(), {'st': st, 'df': chart_df, 'px': px})
+            except Exception:
+                st.info("Could not reload this chart.")
         else: 
             st.markdown(msg["content"])
 
-# Chat Input Logic
+# --- 6. CHAT INPUT LOGIC ---
 if prompt := st.chat_input("Ask a question..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): 
@@ -596,20 +686,22 @@ if prompt := st.chat_input("Ask a question..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Processing..."):
-            # MANDATORY: Config for Persistence/Memory
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
-            chat_history = [f"{m['role']}: {m['content']}" for m in st.session_state.messages[-5:]] # Last 5 messages
-            # One single invoke call
-            output = graph.invoke(
-    {
-        "question": prompt, 
-        "schema": schema_info,
-        "history": chat_history # Pass the history here
-    }, 
-    config=config
-)
             
-            # 1. Handle Clarification Scenario
+            # History injection for the Architect (Memory)
+            chat_history = []
+            for m in st.session_state.messages[-6:]: 
+                role = "User" if m["role"] == "user" else "Assistant"
+                content = "[Data Table]" if isinstance(m["content"], pd.DataFrame) else m["content"]
+                chat_history.append(f"{role}: {content}")
+
+            # Invoke Agent Graph
+            output = graph.invoke(
+                {"question": prompt, "schema": schema_info, "history": chat_history}, 
+                config=config
+            )
+            
+            # 1. Handle Clarification
             if output.get("needs_clarification"):
                 st.markdown(f"🤔 **{output['insight']}**")
                 with st.container():
@@ -624,24 +716,19 @@ if prompt := st.chat_input("Ask a question..."):
             elif output.get("error"):
                 st.error(f"Analysis Error: {output['error']}")
             
-            # 3. Handle Successful Data Result
+            # 3. Handle Greetings/Explanations
+            elif output.get("is_greeting") or output.get("is_explanation"):
+                st.markdown(output["insight"])
+                st.session_state.messages.append({"role": "assistant", "content": output["insight"]})
+
+            # 4. Handle Successful Data Result
             else:
-                # --- NEW FIX: Convert from list of dicts back to DataFrame ---
                 data_from_state = output.get("result")
+                raw_df = pd.DataFrame(data_from_state) if isinstance(data_from_state, list) else data_from_state
                 
-                if isinstance(data_from_state, list):
-                    # This happens because we converted to dict in execute_query_node
-                    raw_df = pd.DataFrame(data_from_state)
-                elif isinstance(data_from_state, pd.DataFrame):
-                    # Fallback in case it's already a DataFrame
-                    raw_df = data_from_state
-                else:
-                    raw_df = pd.DataFrame()
-                # -------------------------------------------------------------
-                
-                if not raw_df.empty:
-                    # Formatting for display
+                if raw_df is not None and not raw_df.empty:
                     display_df = raw_df.copy()
+                    # Formatting...
                     for col in display_df.select_dtypes(include=['number']).columns:
                         if 'cm%' in col.lower() or 'percent' in col.lower():
                             display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}%" if pd.notnull(x) else x)
@@ -650,34 +737,39 @@ if prompt := st.chat_input("Ask a question..."):
 
                     st.subheader("📊 Data Result")
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
-                    
-                    # Store data in session history
                     st.session_state.messages.append({"role": "assistant", "content": display_df})
                     
-                    # Visualization Logic
-                    st.subheader("📈 Visualization")
-                    try:
-                        chart_df = raw_df.copy()
-                        # Ensure numeric types for the chart
-                        for col in chart_df.columns:
-                            if col != chart_df.columns[0]: # Keep first col (usually labels) as is
-                                chart_df[col] = pd.to_numeric(chart_df[col], errors='coerce')
-                        
-                        last_col = chart_df.columns[-1]
-                        chart_df = chart_df.dropna(subset=[last_col])
-
-                        if output.get("chart_code"):
+                    # Persistent Visualization Logic
+                    if output.get("chart_code"):
+                        st.subheader("📈 Visualization")
+                        try:
+                            chart_df = raw_df.copy()
+                            for col in chart_df.columns:
+                                if col != chart_df.columns[0]:
+                                    chart_df[col] = pd.to_numeric(chart_df[col], errors='coerce')
+                            
                             local_vars = {'st': st, 'df': chart_df, 'px': px}
                             exec(output["chart_code"], globals(), local_vars)
-                    except Exception as chart_err:
-                        st.info(f"Visualizer skipped: {chart_err}")
+                            
+                            # Save chart code and data so it reappears in history
+                            st.session_state.messages.append({
+                                "role": "assistant", 
+                                "content": {"is_chart": True, "code": output["chart_code"], "df": chart_df}
+                            })
+                        except Exception as chart_err:
+                            st.info(f"Visualizer skipped: {chart_err}")
 
-                # Show Insight/Summary
                 if output.get("insight"):
                     st.success(f"**Insight:** {output['insight']}")
                     st.session_state.messages.append({"role": "assistant", "content": output["insight"]})
 
-                # Technical Logs
                 if output.get("query") and output["query"] != "SKIP":
                     with st.expander("Technical Log (SQL)"):
                         st.code(output["query"], language="sql")
+
+            # --- CRITICAL: SAVE AFTER EVERY ASSISTANT RESPONSE ---
+            st.session_state.all_chats[st.session_state.thread_id] = {
+                "messages": st.session_state.messages,
+                "updated_at": datetime.now()
+            }
+            save_history()
