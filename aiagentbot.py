@@ -1,4 +1,3 @@
-
 import os
 import pandas as pd
 import sqlite3
@@ -13,6 +12,8 @@ import re  # Added for extracting potential filter values
 from langgraph.checkpoint.memory import MemorySaver
 import uuid
 import pickle
+
+
 
 
 DB_FILE = "financial_agent_history.pkl"
@@ -30,6 +31,23 @@ def load_history():
             return {}
     return {}
 
+def clear_all_history_file():
+    """Permanently deletes the local pickle file and resets state."""
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    st.session_state.all_chats = {}
+    st.session_state.messages = []
+    st.session_state.thread_id = str(uuid.uuid4())
+def delete_chat_session(tid):
+    """Deletes a specific chat from the registry and disk."""
+    if tid in st.session_state.all_chats:
+        del st.session_state.all_chats[tid]
+        save_history()
+        
+        # If we just deleted the chat we are currently looking at, reset to a new one
+        if st.session_state.thread_id == tid:
+            st.session_state.thread_id = str(uuid.uuid4())
+            st.session_state.messages = []
 # --- INITIALIZE STATE ---
 if "all_chats" not in st.session_state:
     st.session_state.all_chats = load_history()
@@ -37,11 +55,10 @@ if "all_chats" not in st.session_state:
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.messages = []
- 
-# ---------- CONFIGURATION ----------
+
  
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
-# --- 1. CONFIGURATION ---
+
 
 # --- 1. CONFIGURATION ---
 
@@ -585,9 +602,10 @@ graph = builder.compile(checkpointer=memory)
 
 
 # --- 1. GLOBAL CONFIG & PERSISTENCE ---
-st.set_page_config(page_title="Financial AI Agent", layout="wide")
+# --- 1. GLOBAL CONFIG & PERSISTENCE ---
+st.set_page_config(page_title="Financial AI Agent", layout="wide", page_icon="🏛️")
 
-# Initialize storage from File
+# Initialize storage from File (Ensuring helper functions exist in your script)
 if "all_chats" not in st.session_state:
     st.session_state.all_chats = load_history()
 
@@ -596,152 +614,275 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.messages = []
 
-# --- 3. SIDEBAR: CHAT HISTORY (ChatGPT Style) ---
-with st.sidebar:
-    st.title("🕒 Chat History")
+# --- 2. PROFESSIONAL UI STYLING (The "Gemini/Grok" Look) ---
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+
+    /* Main background and font */
+    .stApp {
+        background-color: #ffffff;
+        font-family: 'Roboto', sans-serif;
+    }
+
+    /* Sidebar - Clean Light Gray Theme (Inspired by Gemini/Grok) */
+    [data-testid="stSidebar"] {
+        background-color: #f8f9fc !important; /* Subtle light gray for professionalism */
+        border-right: 1px solid #dcdcdc;
+        width: 300px !important; /* Wider sidebar for better usability */
+        padding-top: 1rem;
+    }
+
+    /* FIX: Show the hamburger menu clearly */
+    [data-testid="stHeader"] {
+        background-color: rgba(255, 255, 255, 0);
+        color: #202124;
+    }
+
+    /* Sidebar Title / Branding */
+    .sidebar-brand {
+        font-size: 1.4rem;
+        font-weight: 500;
+        color: #1a73e8; /* Google/Gemini blue */
+        padding: 1rem 1.5rem 1.5rem 1.5rem;
+        border-bottom: 1px solid #e0e0e0;
+    }
+
+    /* Professional Sidebar Section Headers */
+    .sidebar-header {
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: #5f6368;
+        text-transform: uppercase;
+        letter-spacing: 0.05rem;
+        margin: 1.5rem 0 0.75rem 1.5rem;
+    }
+
+    /* Sidebar Buttons - Rounded, Clean, and Subtle */
+    .stButton > button {
+        border: none;
+        background-color: transparent;
+        color: #202124;
+        transition: all 0.2s ease;
+        border-radius: 8px !important; /* Soft rounded corners like Grok/Gemini */
+        text-align: left !important;
+        font-size: 0.95rem;
+        padding: 0.75rem 1.5rem;
+        width: 100%;
+    }
+
+    /* Active Chat Highlight (Subtle Blue Tint) */
+    .stButton > button[kind="primary"] {
+        background-color: #e8f0fe !important; /* Light blue for active state */
+        color: #1967d2 !important;
+        font-weight: 500;
+    }
+
+    /* Hover effect */
+    .stButton > button:hover {
+        background-color: #f1f3f4;
+        border: none;
+    }
+
+    /* Delete Button Styling */
+    .delete-button > button {
+        background-color: transparent;
+        color: #5f6368;
+        font-size: 0.85rem;
+        padding: 0.5rem;
+        min-width: auto;
+        border-radius: 50%;
+    }
+
+    .delete-button > button:hover {
+        background-color: #e8eaed;
+    }
+
+    /* Chat Input Styling */
+    [data-testid="stChatInput"] {
+        border-radius: 28px;
+        border: 1px solid #dadce0;
+        padding: 8px 16px;
+        background-color: #f8f9fa;
+    }
+
+    /* Assistant Message Styling */
+    [data-testid="stChatMessageAssistant"] {
+        background-color: #ffffff !important;
+        border-radius: 12px;
+        padding: 1rem;
+    }
     
-    # "New Chat" Button
-    if st.button("➕ New Chat", use_container_width=True, type="primary"):
-        # Save the current chat before wiping it
+    /* User Message Styling */
+    [data-testid="stChatMessageUser"] {
+        background-color: #e8f0fe !important;
+        border-radius: 12px;
+        padding: 1rem;
+    }
+
+    .main-title {
+        font-family: 'Roboto', sans-serif;
+        font-weight: 500;
+        font-size: 1.8rem;
+        color: #202124;
+        text-align: left;
+        margin: 1rem 0 2rem 0;
+        padding-left: 1rem;
+    }
+
+    /* Expander Styling */
+    .stExpander {
+        border: none;
+        background-color: transparent;
+    }
+
+    .stExpander > div > button {
+        color: #5f6368;
+        font-weight: 500;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- 3. SIDEBAR: CHAT HISTORY ---
+with st.sidebar:
+    st.markdown("<div class='sidebar-brand'>🏛️ Financial IQ</div>", unsafe_allow_html=True)
+    
+    # "New Chat" Action
+    if st.button("➕ New Analysis", use_container_width=True, type="primary"):
         if st.session_state.messages:
             st.session_state.all_chats[st.session_state.thread_id] = {
                 "messages": st.session_state.messages,
                 "updated_at": datetime.now()
             }
             save_history()
-        
-        # Create a brand new session
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.rerun()
-    
-    st.markdown("---")
-    
-    # Sort past chats by timestamp
-    sorted_chats = sorted(
-        st.session_state.all_chats.items(), 
-        key=lambda x: x[1].get("updated_at", datetime.now()), 
-        reverse=True
-    )
 
-    if not sorted_chats and not st.session_state.messages:
-        st.write("No conversations yet.")
+    st.markdown("<p class='sidebar-header'>Recent Analyses</p>", unsafe_allow_html=True)
     
-    for tid, data in sorted_chats:
-        msgs = data["messages"]
-        # Use first user question as title
-        first_q = next((m["content"] for m in msgs if m["role"] == "user"), "New Conversation")
-        title = str(first_q)[:30] + "..." if len(str(first_q)) > 30 else str(first_q)
+    # Scrollable History Container
+    with st.container():
+        sorted_chats = sorted(st.session_state.all_chats.items(), key=lambda x: x[1].get("updated_at", datetime.now()), reverse=True)
         
-        # Highlight active chat
-        is_active = tid == st.session_state.thread_id
-        if st.button(f"💬 {title}", key=tid, use_container_width=True, type="primary" if is_active else "secondary"):
-            # Save current chat state before switching
-            if st.session_state.messages:
-                st.session_state.all_chats[st.session_state.thread_id] = {
-                    "messages": st.session_state.messages,
-                    "updated_at": datetime.now()
-                }
+        for tid, data in sorted_chats:
+            msgs = data["messages"]
+            first_q = next((m["content"] for m in msgs if m["role"] == "user"), "New Analysis")
+            title = str(first_q)[:25] + "..." if len(str(first_q)) > 25 else str(first_q)
             
-            # Switch to selected chat
-            st.session_state.thread_id = tid
-            st.session_state.messages = msgs
-            save_history()
+            updated_at = data.get("updated_at", datetime.now())
+            delta = datetime.now() - updated_at
+            if delta.days >= 1:
+                time_str = f"{delta.days}d ago"
+            elif delta.seconds // 3600 >= 1:
+                time_str = f"{delta.seconds // 3600}h ago"
+            else:
+                time_str = f"{delta.seconds // 60}m ago"
+            
+            button_label = f"{title} • {time_str}"
+            
+            c1, c2 = st.columns([0.85, 0.15])
+            with c1:
+                is_active = tid == st.session_state.thread_id
+                if st.button(button_label, key=f"btn_{tid}", use_container_width=True, type="primary" if is_active else "secondary"):
+                    st.session_state.thread_id = tid
+                    st.session_state.messages = msgs
+                    st.rerun()
+            with c2:
+                st.markdown("<div class='delete-button'>", unsafe_allow_html=True)
+                if st.button("🗑️", key=f"del_{tid}", help="Delete chat"):
+                    delete_chat_session(tid)
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    # Fixed Bottom Controls
+    st.markdown("<div style='margin-top: auto; padding-bottom: 1rem;'></div>", unsafe_allow_html=True)
+    with st.expander("⚙️ Settings"):
+        if st.button("🗑️ Clear All History", use_container_width=True):
+            clear_all_history_file()
             st.rerun()
 
-# --- 4. UI STYLING ---
-st.markdown("""
-    <style>
-    [data-testid="stDataFrame"] td, [data-testid="stDataFrame"] th { text-align: center !important; }
-    .stChatMessage { border-radius: 12px; border: 1px solid #dee2e6; background-color: white; }
-    .main { background-color: #f8f9fa; }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("🏛️ Financial Multi-Agent Intelligence")
+# --- 4. MAIN CHAT INTERFACE ---
+st.markdown("<h1 class='main-title'>Financial Intelligence Engine</h1>", unsafe_allow_html=True)
 
 schema_info = db.get_table_info()
 
-# --- 5. DISPLAY CURRENT CHAT (With Re-rendering Logic) ---
+# Display current conversation
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
+    avatar = "👤" if msg["role"] == "user" else "🏛️"
+    with st.chat_message(msg["role"], avatar=avatar):
         if isinstance(msg["content"], pd.DataFrame): 
             st.dataframe(msg["content"], use_container_width=True, hide_index=True)
         elif isinstance(msg["content"], dict) and msg["content"].get("is_chart"):
-            # Re-render persistent charts from saved code
             try:
                 chart_df = msg["content"]["df"]
                 chart_code = msg["content"]["code"]
                 exec(chart_code, globals(), {'st': st, 'df': chart_df, 'px': px})
             except Exception:
-                st.info("Could not reload this chart.")
+                st.info("Visual rendering unavailable.")
         else: 
             st.markdown(msg["content"])
 
-# --- 6. CHAT INPUT LOGIC ---
-if prompt := st.chat_input("Ask a question..."):
+# --- 5. CHAT INPUT & AGENT LOGIC ---
+if prompt := st.chat_input("Ask about your finances..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): 
+    with st.chat_message("user", avatar="👤"): 
         st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Processing..."):
+    with st.chat_message("assistant", avatar="🏛️"):
+        with st.spinner("Thinking..."):
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
             
-            # History injection for the Architect (Memory)
+            # Prepare memory for LLM
             chat_history = []
             for m in st.session_state.messages[-6:]: 
                 role = "User" if m["role"] == "user" else "Assistant"
                 content = "[Data Table]" if isinstance(m["content"], pd.DataFrame) else m["content"]
                 chat_history.append(f"{role}: {content}")
 
-            # Invoke Agent Graph
+            # Graph Call
             output = graph.invoke(
                 {"question": prompt, "schema": schema_info, "history": chat_history}, 
                 config=config
             )
             
-            # 1. Handle Clarification
+            # Handle Clarification
             if output.get("needs_clarification"):
                 st.markdown(f"🤔 **{output['insight']}**")
-                with st.container():
-                    cols = st.columns(len(output["clarification_options"]))
-                    for idx, option in enumerate(output["clarification_options"]):
-                        if cols[idx].button(option, key=f"clarify_{idx}"):
-                            st.session_state.messages.append({"role": "user", "content": option})
-                            st.rerun()
+                cols = st.columns(len(output["clarification_options"]))
+                for idx, option in enumerate(output["clarification_options"]):
+                    if cols[idx].button(option, key=f"clarify_{idx}"):
+                        st.session_state.messages.append({"role": "user", "content": option})
+                        st.rerun()
                 st.stop()
 
-            # 2. Handle Errors
+            # Result Processing
             elif output.get("error"):
-                st.error(f"Analysis Error: {output['error']}")
+                st.error(f"Error: {output['error']}")
             
-            # 3. Handle Greetings/Explanations
             elif output.get("is_greeting") or output.get("is_explanation"):
                 st.markdown(output["insight"])
                 st.session_state.messages.append({"role": "assistant", "content": output["insight"]})
 
-            # 4. Handle Successful Data Result
             else:
                 data_from_state = output.get("result")
                 raw_df = pd.DataFrame(data_from_state) if isinstance(data_from_state, list) else data_from_state
                 
                 if raw_df is not None and not raw_df.empty:
                     display_df = raw_df.copy()
-                    # Formatting...
+                    # Formatting numbers
                     for col in display_df.select_dtypes(include=['number']).columns:
-                        if 'cm%' in col.lower() or 'percent' in col.lower():
+                        if 'percent' in col.lower() or 'cm%' in col.lower():
                             display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}%" if pd.notnull(x) else x)
                         else:
                             display_df[col] = display_df[col].round(2)
 
-                    st.subheader("📊 Data Result")
+                    st.markdown("#### 📊 Data Insights")
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
                     st.session_state.messages.append({"role": "assistant", "content": display_df})
                     
-                    # Persistent Visualization Logic
                     if output.get("chart_code"):
-                        st.subheader("📈 Visualization")
+                        st.markdown("#### 📈 Visualization")
                         try:
                             chart_df = raw_df.copy()
                             for col in chart_df.columns:
@@ -751,23 +892,22 @@ if prompt := st.chat_input("Ask a question..."):
                             local_vars = {'st': st, 'df': chart_df, 'px': px}
                             exec(output["chart_code"], globals(), local_vars)
                             
-                            # Save chart code and data so it reappears in history
                             st.session_state.messages.append({
                                 "role": "assistant", 
                                 "content": {"is_chart": True, "code": output["chart_code"], "df": chart_df}
                             })
                         except Exception as chart_err:
-                            st.info(f"Visualizer skipped: {chart_err}")
+                            st.info("Chart skipped.")
 
                 if output.get("insight"):
-                    st.success(f"**Insight:** {output['insight']}")
+                    st.success(output['insight'])
                     st.session_state.messages.append({"role": "assistant", "content": output["insight"]})
 
                 if output.get("query") and output["query"] != "SKIP":
-                    with st.expander("Technical Log (SQL)"):
+                    with st.expander("Technical SQL Log"):
                         st.code(output["query"], language="sql")
 
-            # --- CRITICAL: SAVE AFTER EVERY ASSISTANT RESPONSE ---
+            # Final Save
             st.session_state.all_chats[st.session_state.thread_id] = {
                 "messages": st.session_state.messages,
                 "updated_at": datetime.now()
