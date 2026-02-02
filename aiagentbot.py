@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_community.utilities import SQLDatabase
 import plotly.express as px  # Import Plotly Express for interactive charts
 import re  # Added for extracting potential filter values
+from langgraph.checkpoint.memory import MemorySaver
  
 # ---------- CONFIGURATION ----------
  
