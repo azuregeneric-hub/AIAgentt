@@ -121,16 +121,22 @@ build_reverse_lookup()  # Run once
 # --- 3. STATE DEFINITION ---
 class AgentState(TypedDict):
     question: str
+
+    history: List[str]
+
     architect_plan: str      
-    disambiguated_plan: str  # New: Updated plan after column disambiguation
-    query: str              
+    disambiguated_plan: str  
+    query: str               
     result: pd.DataFrame    
     chart_code: str          
     insight: str            
     error: Optional[str]
     schema: str
     is_greeting: bool
-    is_explanation: bool  # Added explicitly
+    is_explanation: bool
+    # --- New Fields for Conversation ---
+    needs_clarification: bool
+    clarification_options: List[str]
  
 # --- 4. AGENT NODES ---
 def architect_agent(state: AgentState):
@@ -138,11 +144,13 @@ def architect_agent(state: AgentState):
     Role: The Brain. Handles greetings, chit-chat, and recursive KPI formula lookups.
     """
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-   
+    history_context = "\n".join(state.get("history", []))
+    
     # Use LLM to classify intent
     intent_prompt = f"""
     Classify the user question: "{state['question']}"
-   
+    CONVERSATION HISTORY:
+    {history_context}
     Possible intents:
     - GREETING_CHITCHAT: Greetings (hi, hello, hey, variations/misspellings), casual questions (how are you, what do you do, what's your work, who are you), off-topic (weather today, unrelated to finance).
     - KPI_EXPLANATION: Questions asking for definitions, formulas, components (e.g., numerator, denominator), how a KPI is calculated, or breakdowns of metrics (e.g., "what is CM%?", "numerator for Revenue?", "explain the formula for Cost"). If the question uses words like 'give the formula', 'what is the formula', 'explain the formula', or similar, classify as KPI_EXPLANATION.
@@ -221,13 +229,16 @@ def architect_agent(state: AgentState):
  
         # Recursive KPI Lookup: Architect looks at CM%, then looks for Revenue/Cost definitions
         prompt = f"""
-        You are the Architect Agent. Your job is to analyze the user question using the KPI context.
+        You are the Architect Agent. Your job is to analyze the user question using the KPI context and conversation history.
        
         Current date: {today}
        
         KPI CONTEXT FROM EXCEL:
         {kpi_context}
-     
+
+        CONVERSATION HISTORY (Use this to carry over filters):
+        {history_context}
+
         USER QUESTION: {state['question']}
      
         DIRECTIONS:
@@ -257,6 +268,10 @@ def architect_agent(state: AgentState):
         - Instead, create a plan to BREAK DOWN the metric by "Group Description" and "Group1".
         - If a specific customer is mentioned (e.g., 'A24'), the plan must specify: "Filter by FinalCustomerName = 'A24' and GROUP BY 'Group Description'".
         - This allows the user to see which specific expenses (like Fuel, Maintenance, etc.) contributed most to the total.
+        19. **MEMORY & FOLLOW-UPS**: If the user question is a follow-up (e.g., "Why?", "Factors for A42?", "What about the second one?"), 
+           you MUST carry over filters (Month, Segment, DU, BU) from the CONVERSATION HISTORY.
+           - Example: If the previous query was for "Jan 2025", and this question is "Why is A42 high?", 
+             the plan MUST include "Filter: Month = '2025-01-01'".
         STRICT HIERARCHY RULES:
         1. **Formula Lookup**: If a user asks for "Cost", look at the 'Formula' column in the KPI context. 
         For Cost, you MUST use: "Group1" IN ('Direct Expense', 'OWN OVERHEADS', 'Indirect Expense', 'Project Level Depreciation', 'Direct Expense - DU Block Seats Allocation','Direct Expense - DU Pool Allocation','Establishment Expenses')
@@ -352,28 +367,41 @@ def sql_analyst_agent(state: AgentState):
     return {"query": clean_sql}
 
 def disambiguator_agent(state: AgentState):
-    if state.get("is_greeting"):
-        return {"disambiguated_plan": state["architect_plan"]}
+    if state.get("is_greeting") or state.get("is_explanation"):
+        return {"disambiguated_plan": state.get("architect_plan", ""), "needs_clarification": False}
 
     potential_values = re.findall(r'\b[a-zA-Z0-9-]{2,}\b', state['question'])
-   
     if not potential_values:
-        return {"disambiguated_plan": state["architect_plan"]}
-   
+        return {"disambiguated_plan": state["architect_plan"], "needs_clarification": False}
+    
     filters = []
-    is_account_query = any(word in state['question'].lower() for word in ['account', 'customer', 'finalcustomername'])  # Enhanced context check
+    is_account_query = any(word in state['question'].lower() for word in ['account', 'customer', 'finalcustomername'])
+    
     for val in set(pv.upper() for pv in potential_values):
         if val in value_to_cols and value_to_cols[val]:
             candidates = value_to_cols[val]
-            # Prefer 'FinalCustomerName' if in candidates and query suggests account
+            unique_cols = list(set([c[1] for c in candidates]))
+
+            # --- NEW: CLARIFICATION LOGIC ---
+            # If a value matches multiple columns and the user hasn't specified context (is_account_query)
+            # and it's not a greeting/explanation, ask for help.
+            if len(unique_cols) > 1 and not is_account_query:
+                options = [f"Search for '{val}' in {col}" for col in unique_cols]
+                return {
+                    "needs_clarification": True,
+                    "clarification_options": options,
+                    "insight": f"I found '{val}' as both a {', '.join(unique_cols[:-1])} and {unique_cols[-1]}. Which one should I use?"
+                }
+            
+            # --- YOUR ORIGINAL PREFERENCE LOGIC ---
             preferred_candidates = [c for c in candidates if c[1] == 'FinalCustomerName'] if is_account_query else candidates
             best = preferred_candidates[0] if preferred_candidates else candidates[0]
             table_alias = 'u' if 'utt' in best[0] else 'p'
-            filter_sql = f'{table_alias}.\"{best[1]}\" = \'{val}\''
-            filters.append(filter_sql)
+            filters.append(f'{table_alias}.\"{best[1]}\" = \'{val}\'')
             print(f"Matched '{val}' → {best[0]}.\"{best[1]}\" ({best[2]} rows)")
+            
         else:
-            # Skip fuzzy for short values (<5 chars) to avoid mismatches; only use if exact not found but longer
+            # --- YOUR ORIGINAL FUZZY LOGIC ---
             if len(val) >= 5:
                 fuzzy = []
                 for v in value_to_cols:
@@ -383,80 +411,110 @@ def disambiguator_agent(state: AgentState):
                     best = max(fuzzy, key=lambda x: x[2])
                     filters.append(f'{ "u" if "utt" in best[0] else "p" }.\"{best[1]}\" LIKE \'%{val}%\'')
             else:
-                print(f"No exact match for short value '{val}'; skipping fuzzy to avoid errors.")
+                print(f"No exact match for short value '{val}'; skipping fuzzy.")
 
     if filters:
         filter_str = " AND " + " AND ".join(filters)
         updated_plan = state["architect_plan"] + f"\n\nADD FILTERS: {filter_str}"
     else:
         updated_plan = state["architect_plan"] + "\n\nNo matching columns for filters."
-   
-    return {"disambiguated_plan": updated_plan}
- 
+    
+    return {
+        "disambiguated_plan": updated_plan, 
+        "needs_clarification": False,
+        "clarification_options": []
+    }
 
+# ... (visualizer_agent, insights_agent, graph, UI remain unchanged)
 def execute_query_node(state: AgentState):
-    if state.get("is_greeting") or state.get("is_explanation") or state.get("query") == "SKIP": return {"result": pd.DataFrame()}
+    if state.get("is_greeting") or state.get("is_explanation") or state.get("query") == "SKIP":
+        return {"result": None} # Use None instead of empty DF
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query(state["query"], conn)
         conn.close()
-        return {"result": df, "error": None}
+        # Convert to dict so MemorySaver can serialize it
+        return {"result": df.to_dict(orient='records'), "error": None} 
     except Exception as e:
-        return {"error": str(e), "result": pd.DataFrame()}
-
-# ... (visualizer_agent, insights_agent, graph, UI remain unchanged)
+        return {"error": str(e), "result": None}
  
 def visualizer_agent(state: AgentState):
-    if state.get("is_greeting") or state.get("is_explanation") or state.get("error") or state["result"].empty: return {"chart_code": ""}
+    # 1. Convert List to DataFrame (Memory Compatibility)
+    res = state.get("result")
+    if isinstance(res, list):
+        df_for_viz = pd.DataFrame(res)
+    elif isinstance(res, pd.DataFrame):
+        df_for_viz = res
+    else:
+        df_for_viz = pd.DataFrame()
+
+    # 2. Safety Check - Use the converted DataFrame
+    if state.get("is_greeting") or state.get("is_explanation") or state.get("error") or df_for_viz.empty: 
+        return {"chart_code": ""}
+    
+    # 3. Use 'df_for_viz' for ALL logic
+    cols = list(df_for_viz.columns) # Use the converted DF
+    num_rows = len(df_for_viz)      # Use the converted DF
+    
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-   
-    cols = list(state['result'].columns)
-    num_rows = len(state['result'])
    
     # We enforce cols[0] as X (Category) and cols[-1] as Y (Numeric)
     prompt = f"""
 Generate Streamlit code to plot this data correctly using plotly.express as px.
-DataFrame is 'df'.
-Columns: {cols} (Note: {cols[0]} is the categorical dimension, {cols[-1]} is the numeric KPI calculation).
+The DataFrame is provided as 'df'.
+Columns: {cols} (Note: {cols[0]} is the categorical dimension, {cols[-1]} is the numeric KPI).
 Number of rows: {num_rows}
- 
+
 Steps to follow:
 1. Detect chart type:
    - If columns include 'Month' or date-like, use px.line(df, x='{cols[0]}', y='{cols[-1]}') for time series.
-   - For all other categorical queries (like FinalCustomerName), ALWAYS use a vertical bar chart to keep categories on the X-axis:
+   - For all other categorical queries (like FinalCustomerName), ALWAYS use a vertical bar chart:
      fig = px.bar(df, x='{cols[0]}', y='{cols[-1]}', orientation='v')
-2. Sort the df by the numeric column for better readability: df = df.sort_values('{cols[-1]}', ascending=False)
-3. If the KPI name contains 'cm%' or 'percent', ensure the y-axis is formatted as a percentage and take the values of the calculated KPI to show in the y axis.
-4. Update layout for axes:
+2. Sort the df by the numeric column: df = df.sort_values('{cols[-1]}', ascending=False)
+3. If the KPI name contains 'cm%' or 'percent', format y-axis as percentage.
+4. Update layout:
    - fig.update_layout(
        xaxis_title='{cols[0].replace("_", " ").title()}',  
        yaxis_title='{cols[-1].replace("_", " ").title()}',  
        yaxis_tickformat='.2f%' if 'cm%' in '{cols[-1]}'.lower() or 'percent' in '{cols[-1]}'.lower() else '.2f',
-       xaxis_showgrid=True, yaxis_showgrid=True,  
-       xaxis_zeroline=True, yaxis_zeroline=True,  
-       xaxis_tickangle=-45  # Always rotate X-axis labels to prevent overlap with many customers
+       xaxis_tickangle=-45
    )
-5. If time series, sort df by the date column: df = df.sort_values('{cols[0]}')
-6. To handle hover details, add hover_data=['{cols[0]}', '{cols[-1]}'].
-7. Finally, st.plotly_chart(fig, use_container_width=True)
-8. Handle empty data: if df.empty, just st.write('No data to plot.')
-RAW CODE ONLY. No explanations or markdown.
+5. If time series, sort df by date: df = df.sort_values('{cols[0]}')
+6. Add hover_data=['{cols[0]}', '{cols[-1]}'].
+7. Finally, call st.plotly_chart(fig, use_container_width=True)
+8. Handle empty data: if df.empty, st.write('No data to plot.')
+RAW CODE ONLY. No markdown.
     """
     response = llm.invoke(prompt)
     return {"chart_code": response.content.strip().replace("```python", "").replace("```", "")}
  
 def insights_agent(state: AgentState):
+    # 1. Handle Greetings or Explanations
     if state.get("is_greeting") or state.get("is_explanation"): 
-        return {"insight": state.get("insight")}
-    
+        # Ensure we don't return None; use a fallback string if insight is missing
+        return {"insight": state.get("insight", "How else can I help you today?")}
+
+    # 2. Handle the 'List vs DataFrame' Memory Issue (Correctly implemented)
+    res = state.get("result")
+    if isinstance(res, list):
+        df = pd.DataFrame(res)
+    elif isinstance(res, pd.DataFrame):
+        df = res
+    else:
+        df = pd.DataFrame()
+
+    # 3. If no data was found
+    if df.empty:
+        return {"insight": "I couldn't find any data matching your specific filters."}
+
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5)
     
-    # Improved prompt for factor analysis
+    # --- FIXED: Use the 'df' variable here, NOT 'state['result']' ---
     prompt = f"""
     Analyze the following data result for the user's question: "{state['question']}"
     
     DATA:
-    {state['result'].to_string()}
+    {df.to_string(index=False)}
     
     INSTRUCTIONS:
     - If the data is a breakdown (multiple rows), identify the top 2-3 highest factors and explain their impact.
@@ -464,28 +522,47 @@ def insights_agent(state: AgentState):
     - Keep it professional and focused on business impact.
     - Limit to 3 concise sentences.
     """
-    response = llm.invoke(prompt)
-    return {"insight": response.content}
+    
+    try:
+        response = llm.invoke(prompt)
+        return {"insight": response.content.strip()}
+    except Exception as e:
+        return {"insight": "Data retrieved successfully, but insight generation failed."}
 # --- 5. GRAPH ---
 builder = StateGraph(AgentState)
+
+# 1. Add all nodes
 builder.add_node("architect", architect_agent)
-builder.add_node("disambiguator", disambiguator_agent)  # New node
+builder.add_node("disambiguator", disambiguator_agent) 
 builder.add_node("sql_analyst", sql_analyst_agent)
 builder.add_node("executor", execute_query_node)
 builder.add_node("visualizer", visualizer_agent)
 builder.add_node("insights", insights_agent)
+
+# 2. Define the flow (Edges)
 builder.add_edge(START, "architect")
-builder.add_edge("architect", "disambiguator")  # New edge
-builder.add_edge("disambiguator", "sql_analyst")  # New edge
+builder.add_edge("architect", "disambiguator")
+builder.add_edge("disambiguator", "sql_analyst")
 builder.add_edge("sql_analyst", "executor")
 builder.add_edge("executor", "visualizer")
 builder.add_edge("visualizer", "insights")
 builder.add_edge("insights", END)
-graph = builder.compile()
- 
+
+# 3. Initialize memory
+memory = MemorySaver()
+
+# 4. Compile (Do NOT re-initialize builder before this!)
+graph = builder.compile(checkpointer=memory)
+
+
 # --- 6. UI ---
 st.set_page_config(page_title="Financial AI Agent", layout="wide")
- 
+
+# Initialize Thread ID for Memory (Persistent across reruns)
+if "thread_id" not in st.session_state:
+    import uuid
+    st.session_state.thread_id = str(uuid.uuid4())
+
 st.markdown("""
     <style>
     [data-testid="stDataFrame"] td, [data-testid="stDataFrame"] th { text-align: center !important; }
@@ -493,94 +570,113 @@ st.markdown("""
     .main { background-color: #f8f9fa; }
     </style>
 """, unsafe_allow_html=True)
- 
+
 st.title("🏛️ Financial Multi-Agent Intelligence")
- 
+
 schema_info = db.get_table_info()
-if "messages" not in st.session_state: st.session_state.messages = []
- 
+
+# Initialize message history
+if "messages" not in st.session_state: 
+    st.session_state.messages = []
+
+# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        if isinstance(msg["content"], pd.DataFrame): st.dataframe(msg["content"], use_container_width=True)
-        else: st.markdown(msg["content"])
- 
+        if isinstance(msg["content"], pd.DataFrame): 
+            st.dataframe(msg["content"], use_container_width=True, hide_index=True)
+        else: 
+            st.markdown(msg["content"])
+
+# Chat Input Logic
 if prompt := st.chat_input("Ask a question..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): st.markdown(prompt)
- 
+    with st.chat_message("user"): 
+        st.markdown(prompt)
+
     with st.chat_message("assistant"):
         with st.spinner("Processing..."):
-            output = graph.invoke({"question": prompt, "schema": schema_info})
-           
-            if output.get("error"):
-                st.error(output["error"])
+            # MANDATORY: Config for Persistence/Memory
+            config = {"configurable": {"thread_id": st.session_state.thread_id}}
+            chat_history = [f"{m['role']}: {m['content']}" for m in st.session_state.messages[-5:]] # Last 5 messages
+            # One single invoke call
+            output = graph.invoke(
+    {
+        "question": prompt, 
+        "schema": schema_info,
+        "history": chat_history # Pass the history here
+    }, 
+    config=config
+)
+            
+            # 1. Handle Clarification Scenario
+            if output.get("needs_clarification"):
+                st.markdown(f"🤔 **{output['insight']}**")
+                with st.container():
+                    cols = st.columns(len(output["clarification_options"]))
+                    for idx, option in enumerate(output["clarification_options"]):
+                        if cols[idx].button(option, key=f"clarify_{idx}"):
+                            st.session_state.messages.append({"role": "user", "content": option})
+                            st.rerun()
+                st.stop()
+
+            # 2. Handle Errors
+            elif output.get("error"):
+                st.error(f"Analysis Error: {output['error']}")
+            
+            # 3. Handle Successful Data Result
             else:
-                raw_df = output.get("result", pd.DataFrame())
-               
-                # --- DATA CLEANING FOR DISPLAY & CHART ---
+                # --- NEW FIX: Convert from list of dicts back to DataFrame ---
+                data_from_state = output.get("result")
+                
+                if isinstance(data_from_state, list):
+                    # This happens because we converted to dict in execute_query_node
+                    raw_df = pd.DataFrame(data_from_state)
+                elif isinstance(data_from_state, pd.DataFrame):
+                    # Fallback in case it's already a DataFrame
+                    raw_df = data_from_state
+                else:
+                    raw_df = pd.DataFrame()
+                # -------------------------------------------------------------
+                
                 if not raw_df.empty:
-                    # Create display version
+                    # Formatting for display
                     display_df = raw_df.copy()
                     for col in display_df.select_dtypes(include=['number']).columns:
                         if 'cm%' in col.lower() or 'percent' in col.lower():
                             display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}%" if pd.notnull(x) else x)
                         else:
                             display_df[col] = display_df[col].round(2)
- 
-                    # --- UI LAYOUT ---
+
                     st.subheader("📊 Data Result")
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
-                   
+                    
+                    # Store data in session history
+                    st.session_state.messages.append({"role": "assistant", "content": display_df})
+                    
+                    # Visualization Logic
                     st.subheader("📈 Visualization")
                     try:
-                        # 1. Ensure numeric columns are actually numeric (fix for "mixed types" error)
                         chart_df = raw_df.copy()
-                        first_col = chart_df.columns[0]
+                        # Ensure numeric types for the chart
+                        for col in chart_df.columns:
+                            if col != chart_df.columns[0]: # Keep first col (usually labels) as is
+                                chart_df[col] = pd.to_numeric(chart_df[col], errors='coerce')
+                        
                         last_col = chart_df.columns[-1]
-                        # Force all columns except the first to be numeric, errors to NaN
-                        for col in chart_df.columns[1:]:
-                            chart_df[col] = pd.to_numeric(chart_df[col], errors='coerce')
-                       
-                        # Drop NaNs if any
                         chart_df = chart_df.dropna(subset=[last_col])
-                       
-                        # Additional preprocessing: Sort by last column for better viz
-                        chart_df = chart_df.sort_values(by=last_col)
-                       
-                        # If 'Month' exists, ensure it's datetime
-                        if 'Month' in chart_df.columns:
-                            chart_df['Month'] = pd.to_datetime(chart_df['Month'], errors='coerce')
-                       
-                        # 2. Execute chart code
+
                         if output.get("chart_code"):
-                            # Log for debugging
-                            with st.expander("Generated Chart Code (Debug)"):
-                                st.code(output["chart_code"], language="python")
-                           
-                            # Exec in a safe locals dict to avoid polluting globals
-                            local_vars = {'st': st, 'df': chart_df.copy(), 'px': px}  # Use copy to avoid modifying original
+                            local_vars = {'st': st, 'df': chart_df, 'px': px}
                             exec(output["chart_code"], globals(), local_vars)
-                        else:
-                            st.write("No visualization generated.")
                     except Exception as chart_err:
-                        st.error(f"Chart generation failed: {chart_err}")
-                        # Improved fallback: Use Plotly instead of Altair for consistency
-                        if not raw_df.empty:
-                            is_horizontal = len(chart_df) > 10
-                            fig = px.bar(chart_df, y=first_col if is_horizontal else first_col,
-                                         x=last_col if is_horizontal else last_col,
-                                         orientation='h' if is_horizontal else 'v')
-                            fig.update_layout(
-                                xaxis_title=last_col.replace("_", " ").title() if is_horizontal else first_col.replace("_", " ").title(),
-                                yaxis_title=first_col.replace("_", " ").title() if is_horizontal else last_col.replace("_", " ").title(),
-                                yaxis_tickformat='.2f%' if '%' in last_col.lower() else '.2f',
-                                xaxis_tickangle=-45 if not is_horizontal else 0
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
- 
-                st.success(f"**Insight:** {output['insight']}")
-                st.session_state.messages.append({"role": "assistant", "content": display_df if not raw_df.empty else "No data."})
-                st.session_state.messages.append({"role": "assistant", "content": output["insight"]})
- 
-                with st.expander("Technical Log"):
-                    st.code(output["query"], language="sql")
+                        st.info(f"Visualizer skipped: {chart_err}")
+
+                # Show Insight/Summary
+                if output.get("insight"):
+                    st.success(f"**Insight:** {output['insight']}")
+                    st.session_state.messages.append({"role": "assistant", "content": output["insight"]})
+
+                # Technical Logs
+                if output.get("query") and output["query"] != "SKIP":
+                    with st.expander("Technical Log (SQL)"):
+                        st.code(output["query"], language="sql")
