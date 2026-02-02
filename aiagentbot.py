@@ -56,6 +56,7 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.messages = []
 
+# ---------- CONFIGURATION ----------
  
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
 
